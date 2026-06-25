@@ -26,6 +26,28 @@ The test, command, or generated assembly behavior that proved the fix.
 
 No issues recorded yet.
 
+## 2026-06-25 - 远程评测机链接 `yy_scan_bytes` 未定义
+
+**Stage**: Build / RISC-V Backend
+
+**Problem**:
+提交到远程评测平台时构建失败，链接器报 `undefined reference to yy_scan_bytes(char const*, unsigned long)`，而本机 macOS 构建一直正常。
+
+**Cause**:
+`src/frontend/parser_driver.cpp` 手写了 `extern YY_BUFFER_STATE yy_scan_bytes(const char*, unsigned long)`，参数类型硬编码为 `unsigned long`。Flex 生成的真实签名为 `yy_scan_bytes(const char*, yy_size_t)`，而 `yy_size_t` 的定义随 Flex 版本不同：本机 Flex 2.6.4 为 `typedef size_t yy_size_t`（macOS LP64 下 `size_t == unsigned long`），符号 mangling 一致所以能链接；远程评测机的旧版 Flex 把 `yy_size_t` 定义为 `int`，生成的定义符号以 `int` 参数 mangling，与 `parser_driver.cpp` 期望的 `unsigned long` 不匹配，于是链接器找不到符号。
+
+此前的 commit “use unsigned long for yy_scan_bytes to match Flex's size_t on Linux” 只在“远程 Flex 的 yy_size_t 恰好是 size_t”时成立，对旧 Flex 无效。
+
+**Resolution**:
+不再手写 Flex 函数的类型声明，改为让 Flex 生成头文件并直接包含。改动：
+1. `CMakeLists.txt` 的 `flex_target` 增加 `DEFINES_FILE ${CMAKE_CURRENT_BINARY_DIR}/lexer.lex.hpp`，使 Flex 通过 `--header-file` 生成包含正确 `yy_size_t` 与函数声明的头文件。
+2. `src/frontend/parser_driver.cpp` 改为 `#include "lexer.lex.hpp"`，删除手写的 `extern YY_BUFFER_STATE yy_scan_bytes`、`yy_delete_buffer`、`yylex_destroy` 以及 `struct yy_buffer_state`/`using YY_BUFFER_STATE` 自定义类型。`extern int yyparse(void);`（Bison 的）保留。
+
+这样无论 Flex 把 `yy_size_t` 定义为 `int` 还是 `size_t`，`parser_driver.cpp` 的声明与生成的 `lexer.lex.cpp` 中的定义来自同一份 Flex 产物，类型永远一致。
+
+**Verification**:
+`rm -rf build && cmake -S . -B build -DBISON_EXECUTABLE=... && cmake --build build` 干净构建通过；`lexer.lex.hpp` 中 `yy_size_t` 与 `yy_scan_bytes` 声明与 `lexer.lex.cpp` 一致；递归、循环/`break`/`continue`、全局常量+`void`、十参数、逻辑短路等样例汇编仍能正常生成。
+
 ## 2026-06-22 - Bison output directive rejected
 
 **Stage**: Build
