@@ -230,11 +230,24 @@ class FunctionEmitter {
   // 后端在 emitBinary 中据此把 mul/div/rem 常量优化为 shift/and/addi 等等，
   // 也可以把常量短直接 li 到工作寄存器，省略 sw/lw 的中间往返。
   std::unordered_map<int, int> slotConst_;
+  // 单次使用的临时 slot 集合（用于跳过 sw 的窥孔）。一个 slot 进入此集合
+  // 当且仅当：① 仅有一次 IR-读取，② 不是 namedSlot（不是用户变量），
+  // ③ 不是 paramSlot（参数有自己的栈位约束）。命中时 storeSlot 跳过 sw、
+  // 仅写入 cache。下一条读取由 cache hit 用 mv 完成。
+  // 计算"可省略 sw 的 slot 集"。条件：
+  //   ① 该 slot 只有一次读 (reads==1)
+  //   ② 唯一的读取指令在 def 之后、第一个控制流屏障 / a0-overwrite 之前
+  //   ③ 该读取指令本身只通过 loadSlot 来访问
+  // 实现：精准地标"def-index"，向前扫描到 reader-index，期间不能跨越
+  // Label/Goto/Branch/Return/Call。读取指令必须就是下一条非 Label 指令。
+  std::unordered_set<int> skipStore_;
   void computeConstSlots() {
     std::unordered_map<int, int> defs;  // slot -> def count
     std::unordered_map<int, int> values;
+    std::unordered_map<int, int> reads;
     using Op = ir::Instruction::Op;
     for (const auto &i : func_.instructions) {
+      for (int s : readsOf(i)) ++reads[s];
       switch (i.op) {
         case Op::Const:
           if (i.dest != -1) {
@@ -255,6 +268,47 @@ class FunctionEmitter {
     }
     for (const auto &kv : defs)
       if (kv.second == 1) slotConst_[kv.first] = values[kv.first];
+
+    // singleUseTemps_: 1 read, 1 def (any kind), 非命名、非参数
+    std::unordered_set<int> namedSet(func_.namedSlots.begin(), func_.namedSlots.end());
+    std::unordered_set<int> paramSet(func_.paramSlots.begin(), func_.paramSlots.end());
+    std::unordered_set<int> oneReadOneDefTemps;
+    for (const auto &kv : defs) {
+      const int slot = kv.first;
+      if (namedSet.count(slot) || paramSet.count(slot)) continue;
+      auto rit = reads.find(slot);
+      if (rit == reads.end() || rit->second != 1) continue;
+      oneReadOneDefTemps.insert(slot);
+    }
+
+    // skipStore_: 严格条件——定义 slot 的指令之后，紧接着（允许跨越纯
+    // fall-through 标签，不允许跨越任何写 a0 的指令）的下一条指令就是
+    // 唯一的读者。读者必须是不会篡改 a0 的 loadSlot 调用者（Branch/
+    // Return/Move/StoreGlobal 等）。
+    // 简化判据：紧邻的下一条非 Label 指令必须读 slot 作为其首个/唯一操作数，
+    // 且读取后立即被消费（Branch/Return）。
+    for (std::size_t i = 0; i < func_.instructions.size(); ++i) {
+      const auto &inst = func_.instructions[i];
+      if (inst.dest == -1 || !oneReadOneDefTemps.count(inst.dest)) continue;
+      // 只对 Binary/Unary 的 dest 启用（这些一定把结果留在 a0），不对
+      // Const/Move/LoadGlobal/Call 启用——它们的 storeSlot 也可省略，
+      // 但 Call 的 a0 是返回值且 cache 在 Call 后失效，单独处理风险大。
+      if (inst.op != ir::Instruction::Op::Binary &&
+          inst.op != ir::Instruction::Op::Unary) continue;
+      const int defSlot = inst.dest;
+      // 找下一条非 Label 的指令
+      std::size_t j = i + 1;
+      while (j < func_.instructions.size() &&
+             func_.instructions[j].op == ir::Instruction::Op::Label) ++j;
+      if (j == func_.instructions.size()) continue;
+      const auto &nx = func_.instructions[j];
+      // 必须是只读 defSlot 一次、不调用、不会重写 cache 整体的指令
+      if (nx.op == ir::Instruction::Op::Branch && nx.lhs == defSlot) {
+        skipStore_.insert(defSlot);
+      } else if (nx.op == ir::Instruction::Op::Return && nx.lhs == defSlot) {
+        skipStore_.insert(defSlot);
+      }
+    }
   }
   bool isConstSlot(int slot, int &outVal) const {
     auto it = slotConst_.find(slot);
@@ -300,6 +354,14 @@ class FunctionEmitter {
     auto m = regMap_.find(slot);
     if (m != regMap_.end()) {
       out_ << "  mv " << m->second << ", " << reg << "\n";
+      return;
+    }
+    // 严格 peephole：slot 是"下一条指令就是它唯一读者，且读者只用 mv/
+    // load 形式消费 a0"——直接跳过 sw、保持 cache 中即可。
+    if (skipStore_.count(slot)) {
+      dropSlot(slot);
+      cache_.push_back({slot, regs});
+      while (static_cast<int>(cache_.size()) > kCacheCap) cache_.erase(cache_.begin());
       return;
     }
     emitSwReg(reg, slotOffset(slot), "s0");
