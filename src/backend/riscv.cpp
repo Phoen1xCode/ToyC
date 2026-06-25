@@ -290,24 +290,37 @@ class FunctionEmitter {
     for (std::size_t i = 0; i < func_.instructions.size(); ++i) {
       const auto &inst = func_.instructions[i];
       if (inst.dest == -1 || !oneReadOneDefTemps.count(inst.dest)) continue;
-      // 只对 Binary/Unary 的 dest 启用（这些一定把结果留在 a0），不对
-      // Const/Move/LoadGlobal/Call 启用——它们的 storeSlot 也可省略，
-      // 但 Call 的 a0 是返回值且 cache 在 Call 后失效，单独处理风险大。
+      // 仅对 Binary/Unary/Const 的 dest 启用：它们都把结果留在 a0。
+      // Move/LoadGlobal/Call 不计——Call 在自身后清空 cache。
       if (inst.op != ir::Instruction::Op::Binary &&
-          inst.op != ir::Instruction::Op::Unary) continue;
+          inst.op != ir::Instruction::Op::Unary &&
+          inst.op != ir::Instruction::Op::Const) continue;
       const int defSlot = inst.dest;
-      // 找下一条非 Label 的指令
       std::size_t j = i + 1;
       while (j < func_.instructions.size() &&
              func_.instructions[j].op == ir::Instruction::Op::Label) ++j;
       if (j == func_.instructions.size()) continue;
       const auto &nx = func_.instructions[j];
-      // 必须是只读 defSlot 一次、不调用、不会重写 cache 整体的指令
-      if (nx.op == ir::Instruction::Op::Branch && nx.lhs == defSlot) {
-        skipStore_.insert(defSlot);
-      } else if (nx.op == ir::Instruction::Op::Return && nx.lhs == defSlot) {
-        skipStore_.insert(defSlot);
+      bool ok = false;
+      switch (nx.op) {
+        case ir::Instruction::Op::Branch:
+        case ir::Instruction::Op::Return:
+        case ir::Instruction::Op::Unary:
+        case ir::Instruction::Op::Move:
+        case ir::Instruction::Op::StoreGlobal:
+          ok = (nx.lhs == defSlot);
+          break;
+        case ir::Instruction::Op::Binary:
+          // Binary loadSlot 先 lhs 入 t0、再 rhs 入 a0。若 defSlot 是 lhs，
+          // cache 命中把 a0 → t0；接着 rhs 加载可能覆盖 a0，没关系（temp
+          // 不再被需要）。若 defSlot 是 rhs，loadSlot rhs 也命中。安全。
+          ok = (nx.lhs == defSlot) || (nx.rhs == defSlot);
+          break;
+        default:
+          ok = false;
+          break;
       }
+      if (ok) skipStore_.insert(defSlot);
     }
   }
   bool isConstSlot(int slot, int &outVal) const {
