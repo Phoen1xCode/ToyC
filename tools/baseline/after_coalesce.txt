@@ -1,0 +1,16 @@
+name                   refexit   got        status     asm#         steps
+--------------------------------------------------------------------------
+p01_const.tc               184   184          PASS       42          1724
+p02_dead_code.tc            86    86          PASS       84          5524
+p03_copy.tc                191   191          PASS       47          3230
+p04_common_subexpr.tc      140   140          PASS      141         61528
+p05_algebra.tc              56    56          PASS       77         50026
+p06_tail_recursion.tc      228   228          PASS      143        190465
+p07_loop.tc                120   120          PASS       45        200024
+p08_basic_combined.tc       16    16          PASS      115        550024
+p09_advanced_graph.tc        4     4          PASS      155         25835
+p10_advanced_matrix.tc      89    89          PASS      130      12424804
+p11_global_const_prop.tc     224   224          PASS      100        335024
+p12_const_expr_chain.tc     164   164          PASS       89        160072
+------------------------------------------------------------------------
+PASS 12/12

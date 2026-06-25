@@ -376,12 +376,69 @@ bool csePass(ir::Function &fn) {
   return any;
 }
 
+// Copy-coalesce: when `Move d <- s` and slot s is defined exactly once by a pure
+// recipe (Const/Unary/Binary/LoadGlobal) and used exactly once (this Move),
+// re-target that single def to write d instead of s, then drop the Move.
+// Reduces per-iteration sw/lw churn for expressions like `s = s + i` that
+// otherwise materialize a temp.
+bool copyCoalescePass(ir::Function &fn) {
+  bool any = false;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    std::unordered_map<int,int> uses = computeUseCount(fn);
+    // single def site (by index) for each slot, or size_t(-1) if multiple defs.
+    std::unordered_map<int, std::size_t> singleDef;
+    for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
+      const auto &inst = fn.instructions[i];
+      if (!definesSlot(inst)) continue;
+      auto it = singleDef.find(inst.dest);
+      if (it == singleDef.end()) singleDef.emplace(inst.dest, i);
+      else it->second = static_cast<std::size_t>(-1);
+    }
+    // Pass 1: pick coalescable moves (s -> d). Record one re-target per s.
+    std::unordered_map<int, int> retarget;  // s -> d
+    for (const auto &inst : fn.instructions) {
+      if (inst.op != Op::Move) continue;
+      const int s = inst.lhs;
+      const int d = inst.dest;
+      if (s == -1 || d == s) continue;
+      auto uit = uses.find(s);
+      auto dit = singleDef.find(s);
+      if (uit == uses.end() || uit->second != 1) continue;
+      if (dit == singleDef.end() || dit->second == static_cast<std::size_t>(-1)) continue;
+      const Inst &def = fn.instructions[dit->second];
+      if (def.op != Op::Const && def.op != Op::Unary &&
+          def.op != Op::Binary && def.op != Op::LoadGlobal) continue;
+      retarget[s] = d;
+    }
+    if (retarget.empty()) break;
+    // Pass 2: rebuild. Defs of s become defs of d. Drop the Move.
+    std::vector<Inst> kept;
+    kept.reserve(fn.instructions.size());
+    for (auto &inst : fn.instructions) {
+      if (inst.op == Op::Move) {
+        auto it = retarget.find(inst.lhs);
+        if (it != retarget.end()) { changed = true; any = true; continue; }
+      }
+      if (definesSlot(inst)) {
+        auto it = retarget.find(inst.dest);
+        if (it != retarget.end()) inst.dest = it->second;
+      }
+      kept.push_back(inst);
+    }
+    fn.instructions = std::move(kept);
+  }
+  return any;
+}
+
 void optimizeFunction(ir::Function &fn) {
   for (int iter = 0; iter < 16; ++iter) {
     bool any = false;
     any |= constFoldPass(fn);
     any |= copyPropPass(fn);
     any |= csePass(fn);
+    any |= copyCoalescePass(fn);
     any |= dcePass(fn);
     if (!any) break;
   }

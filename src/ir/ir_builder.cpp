@@ -127,6 +127,7 @@ class Builder {
     for (const auto &param : func.params) {
       const int slot = newSlot();
       current_.paramSlots.push_back(slot);
+      current_.namedSlots.push_back(slot);
       scopes_.back()[param.name] = Binding{Binding::Kind::Slot, slot, 0, {}};
     }
     emitStmt(*func.body);
@@ -308,6 +309,7 @@ class Builder {
   void emitDecl(const Decl &decl) {
     if (const auto *var = dynamic_cast<const VarDecl *>(&decl)) {
       const int slot = newSlot();
+      current_.namedSlots.push_back(slot);
       scopes_.back()[var->name] = Binding{Binding::Kind::Slot, slot, 0, {}};
       const int value = emitExpr(*var->initializer);
       emitMove(slot, value);

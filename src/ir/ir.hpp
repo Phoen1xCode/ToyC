@@ -62,6 +62,9 @@ struct Function {
   std::string name;
   std::vector<int> paramSlots;
   int slotCount = 0;
+  // 用户命名的局部变量与形参所在的槽号（非临时）。后端可优先把这些槽位
+  // 映射到物理寄存器，因为它们生命周期长、常穿越循环。
+  std::vector<int> namedSlots;
   std::vector<Instruction> instructions;
 };
 
