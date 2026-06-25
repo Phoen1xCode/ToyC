@@ -12,7 +12,37 @@
 namespace toycc::backend {
 namespace {
 
-int slotOffset(int slot) { return -12 - slot * 4; }
+int slotOffset(int slot, int savedSRegs) {
+  // 局部社于 s-reg 保存区之下：ra/s0 在 s0-4..s0-8，随后被保存的
+  // s2..s11（占 savedSRegs 个），再向下才是社区。未分配时 savedSRegs=0。
+  return -12 - savedSRegs * 4 - slot * 4;
+}
+
+// 返回指令读取的社位号（用于寄存器分配的使用频率统计）。
+std::vector<int> readsOf(const ir::Instruction &i) {
+  std::vector<int> out;
+  using Op = ir::Instruction::Op;
+  switch (i.op) {
+    case Op::Move:
+    case Op::StoreGlobal:
+    case Op::Unary:
+    case Op::Branch:
+    case Op::Return:
+      if (i.lhs != -1) out.push_back(i.lhs);
+      break;
+    case Op::Binary:
+      if (i.lhs != -1) out.push_back(i.lhs);
+      if (i.rhs != -1) out.push_back(i.rhs);
+      break;
+    case Op::Call:
+      for (int a : i.args)
+        if (a != -1) out.push_back(a);
+      break;
+    default:
+      break;
+  }
+  return out;
+}
 
 int frameSize(const ir::Function &func) {
   const int localBytes = 8 + func.slotCount * 4;
@@ -24,7 +54,8 @@ class FunctionEmitter {
   FunctionEmitter(const ir::Function &func, std::ostream &out) : func_(func), out_(out) {}
 
   void emit() {
-    frameSize_ = frameSize(func_);
+    allocateRegisters();
+    frameSize_ = computeFrameSize();
     collectBranchTargets();
     out_ << "  .text\n"
          << "  .globl " << func_.name << "\n"
@@ -32,16 +63,18 @@ class FunctionEmitter {
     emitAddSp(-frameSize_);
     emitSwReg("ra", frameSize_ - 4, "sp");
     emitSwReg("s0", frameSize_ - 8, "sp");
+    for (std::size_t i = 0; i < savedSRegs_.size(); ++i)
+      emitSwReg(savedSRegs_[i], frameSize_ - 12 - static_cast<int>(i) * 4, "sp");
     emitAddiReg("s0", "sp", frameSize_);
 
     for (std::size_t i = 0; i < func_.paramSlots.size(); ++i) {
-      const int offset = slotOffset(func_.paramSlots[i]);
+      const int slot = func_.paramSlots[i];
+      // 参数一律落栈，不录入 s-reg。避免调用方在 emitCall 中复用 a-i 与被调
+      // 用方映射到同一 s-reg 的冲突路径。
+      const int offset = slotOffset(slot);
       if (i < 8) {
         emitSwReg("a" + std::to_string(i), offset, "s0");
       } else {
-        // 参数 8+ 由调用方放在调用者栈上（位于 sp 之前）；
-        // 我们约定调用方按溢出顺序写入以 s0 为基址的正偏移，
-        // 即 (i-8)*4。为 i*4 偏移过大时同样需要大偏移 helper。
         emitLwReg("t0", (static_cast<int>(i) - 8) * 4, "s0");
         emitSwReg("t0", offset, "s0");
       }
@@ -51,6 +84,8 @@ class FunctionEmitter {
     out_ << returnLabel() << ":\n";
     emitLwReg("ra", -4, "s0");
     emitLwReg("s0", -8, "s0");
+    for (std::size_t i = 0; i < savedSRegs_.size(); ++i)
+      emitLwReg(savedSRegs_[i], -12 - static_cast<int>(i) * 4, "s0");
     emitAddSp(frameSize_);
     out_ << "  ret\n";
   }
@@ -143,7 +178,59 @@ class FunctionEmitter {
   }
   void invalidateCache() { cache_.clear(); }
 
+  // 选出使用频率最高的若干用户命名社位（VarDecl，不含参数）映射到 s2..s11。
+  // 这些通常是循环中贯穿的归纳变量/累加器，入 s-reg 后避免每次 lw/sw。
+  // 参数一律落栈不参与映射，避免调用约定复杂交互。
+  std::unordered_map<int, std::string> regMap_;
+  std::vector<std::string> savedSRegs_;
+  static constexpr int kMaxRegAlloc = 10;  // s2..s11
+  void allocateRegisters() {
+    if (func_.namedSlots.empty()) return;
+    std::unordered_map<int, int> uses;
+    for (const auto &inst : func_.instructions)
+      for (int s : readsOf(inst)) ++uses[s];
+    // 只考虑 VarDecl 产生的 namedSlot；参数已设为落栈，这里排除 paramSlots。
+    std::unordered_set<int> paramSet(func_.paramSlots.begin(), func_.paramSlots.end());
+    std::vector<std::pair<int,int>> ranked;
+    for (int s : func_.namedSlots) {
+      if (paramSet.count(s)) continue;
+      int u = uses.count(s) ? uses[s] : 0;
+      if (u > 0) ranked.emplace_back(u, s);
+    }
+    auto cmp = [](const std::pair<int,int>&a, const std::pair<int,int>&b){
+      if (a.first != b.first) return a.first > b.first;
+      return a.second < b.second;
+    };
+    std::sort(ranked.begin(), ranked.end(), cmp);
+    int pick = std::min<int>(kMaxRegAlloc, static_cast<int>(ranked.size()));
+    for (int i = 0; i < pick; ++i) {
+      int s = ranked[i].second;
+      const std::string r = "s" + std::to_string(2 + i);
+      regMap_[s] = r;
+      savedSRegs_.push_back(r);
+    }
+  }
+
+  int slotOffset(int slot) const {
+    return ::toycc::backend::slotOffset(slot, static_cast<int>(savedSRegs_.size()));
+  }
+
+  int computeFrameSize() const {
+    const int localBytes =
+        8 + static_cast<int>(savedSRegs_.size()) * 4 + func_.slotCount * 4;
+    return std::max(16, ((localBytes + 15) / 16) * 16);
+  }
+
+  bool isRegAllocated(int slot) const { return regMap_.find(slot) != regMap_.end(); }
+
   void loadSlot(const char *reg, int slot) {
+    // 被寄存器分配的 slot 其家在 s-reg；不走 cache，也不可被缓存命中
+    // （cache 中临时 reg 早已被覆盖）。
+    auto m = regMap_.find(slot);
+    if (m != regMap_.end()) {
+      out_ << "  mv " << reg << ", " << m->second << "\n";
+      return;
+    }
     if (const CacheRow *c = findCached(slot)) {
       if (reg != c->reg) {
         out_ << "  mv " << reg << ", " << c->reg << "\n";
@@ -161,14 +248,14 @@ class FunctionEmitter {
   }
 
   void storeSlot(const char *reg, int slot) {
-    emitSwReg(reg, slotOffset(slot), "s0");
     std::string regs(reg);
-    // sw 不修改源 reg；reg 上原本缓存的别的 slot 仍与内存一致（但内存
-    // 中该 slot 仍是旧值，不需要修改）。但是我们登记新 cache (slot, reg)，
-    // 而 reg 此前若已在别条 cache 中（reg 仍是別的 slot 的有效缓存）则
-    // 该 slot 的实际内存值仍是旧值，与 reg 内容不同；敝 斧 避 产生 例 错。
-    // 为安全起见，先以 dropReg 清除任何 “reg 是另外一套 slot 的缓存” 的
-    // 陈腐语义。
+    auto m = regMap_.find(slot);
+    if (m != regMap_.end()) {
+      out_ << "  mv " << m->second << ", " << reg << "\n";
+      // 被分配的 slot 不进 cache；其家在 s-reg，永不再 lw。
+      return;
+    }
+    emitSwReg(reg, slotOffset(slot), "s0");
     addCache(slot, regs);
   }
 
