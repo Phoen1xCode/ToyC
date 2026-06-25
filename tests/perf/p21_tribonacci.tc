@@ -1,0 +1,9 @@
+// p21_tribonacci: 三路递归压栈
+int trib(int n) {
+  if (n < 3) return 1;
+  return trib(n - 1) + trib(n - 2) + trib(n - 3);
+}
+int main() {
+  int r = trib(18);
+  return r % 256;
+}

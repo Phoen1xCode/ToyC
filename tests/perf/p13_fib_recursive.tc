@@ -1,0 +1,11 @@
+// p13_fib_recursive: 函数调用 ABI / 栈帧 / 递归
+// fib(28) ≈ 514k 次调用，纯标量
+int fib(int n) {
+  if (n < 2) return n;
+  return fib(n - 1) + fib(n - 2);
+}
+
+int main() {
+  int r = fib(24);
+  return r % 256;
+}

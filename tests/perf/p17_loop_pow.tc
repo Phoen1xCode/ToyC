@@ -1,0 +1,13 @@
+// p17_loop_pow: 大循环常量传播 + CSE
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 100000) {
+    int a = i * 3;
+    int b = i * 3;            // 应被 CSE 与 a 合并
+    int c = (i + 7) * 2;
+    s = s + a + b + c;
+    i = i + 1;
+  }
+  return s % 256;
+}

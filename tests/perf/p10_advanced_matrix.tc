@@ -4,11 +4,11 @@ int main() {
   int tr = 0;
   int dr = 0;
   int ll = 0;
-  while (i < 64) {
+  while (i < 40) {
     int j = 0;
-    while (j < 64) {
+    while (j < 40) {
       int z = 0;
-      while (z < 64) {
+      while (z < 40) {
         int v = (i * j + z) % 7;   // 内层三元乘加
         tr = tr + v;
         if (i == j) dr = dr + v;

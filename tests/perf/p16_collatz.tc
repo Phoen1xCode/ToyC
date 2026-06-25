@@ -1,0 +1,19 @@
+// p16_collatz: Collatz 步数。考察循环 + 强分支 + 模/除常量优化
+int steps(int n) {
+  int c = 0;
+  while (n != 1) {
+    if (n - (n / 2) * 2 == 0) n = n / 2;
+    else n = 3 * n + 1;
+    c = c + 1;
+  }
+  return c;
+}
+int main() {
+  int s = 0;
+  int i = 1;
+  while (i <= 10) {
+    s = s + steps(i);
+    i = i + 1;
+  }
+  return s % 256;
+}

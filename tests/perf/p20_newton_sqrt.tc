@@ -1,0 +1,20 @@
+// p20_newton_sqrt: 牛顿法整数平方根，循环内 div/mul 热点
+int isqrt(int n) {
+  if (n < 2) return n;
+  int x = n / 2;
+  while (1) {
+    int nx = (x + n / x) / 2;
+    if (nx >= x) return x;
+    x = nx;
+  }
+  return x;
+}
+int main() {
+  int s = 0;
+  int i = 1;
+  while (i <= 30) {
+    s = s + isqrt(i);
+    i = i + 1;
+  }
+  return s % 256;
+}

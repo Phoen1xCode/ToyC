@@ -1,0 +1,26 @@
+// p23_hoist_chain: hoist-1.sy 风格——大量参数函数，循环体内重复同一个不变和
+// (从 compiler2021/hoist-1.sy 改造，去掉 I/O，循环次数硬编码)
+int func(int a1, int a2, int a3, int a4, int a5,
+         int a6, int a7, int a8, int a9, int a10) {
+  int result = 0;
+  int i = 0;
+  while (i < 200) {
+    int sum = 0;
+    sum = sum + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10;
+    sum = sum + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10;
+    sum = sum + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10;
+    sum = sum + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10;
+    sum = sum + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10;
+    sum = sum + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10;
+    sum = sum + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10;
+    sum = sum + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10;
+    result = result + sum;
+    i = i + 1;
+  }
+  return result;
+}
+
+int main() {
+  int r = func(1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+  return r % 256;
+}

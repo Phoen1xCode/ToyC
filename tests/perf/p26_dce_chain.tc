@@ -1,0 +1,25 @@
+// p26_dce_chain: 大量死代码，DCE pass 应该把它们清除掉
+int compute(int x) {
+  int a = x + 1;
+  int b = x + 2;
+  int c = x + 3;
+  int d = x + 4;
+  int e = a + b;
+  int f = c + d;
+  int g = e + f;
+  int h = g + a + b + c + d;     // 没用到 h、e、f、g
+  int i = x * 2;
+  int j = x * 3;
+  int k = x * 4;
+  int l = x * 5;                  // 也没人用
+  return x + 1;                   // 实际只用了 x
+}
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 100000) {
+    s = s + compute(i);
+    i = i + 1;
+  }
+  return s % 256;
+}

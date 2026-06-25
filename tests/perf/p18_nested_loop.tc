@@ -1,0 +1,18 @@
+// p18_nested_loop: 嵌套循环 + 循环不变量外提（LICM 测试核心）
+int main() {
+  int s = 0;
+  int a = 13;
+  int b = 7;
+  int i = 0;
+  while (i < 200) {
+    int j = 0;
+    while (j < 200) {
+      // a*b 与 (a+b) 都与 j 无关，期望 LICM 把它提到 j 循环外
+      int t = a * b + (a + b) + j;
+      s = s + t;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return s % 256;
+}

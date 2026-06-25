@@ -1,0 +1,28 @@
+// p25_inst_combine: 大量 +1 -1 链，期望被合并
+int compute(int x) {
+  x = x + 1;
+  x = x + 1;
+  x = x + 1;
+  x = x + 1;
+  x = x + 1;
+  x = x - 1;
+  x = x + 1;
+  x = x + 1;
+  x = x - 2;
+  x = x + 3;
+  x = x - 1;
+  x = x + 1;
+  x = x + 1;
+  x = x - 1;
+  x = x + 1;
+  return x;
+}
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 50000) {
+    s = s + compute(i);
+    i = i + 1;
+  }
+  return s % 256;
+}

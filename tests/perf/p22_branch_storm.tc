@@ -1,0 +1,12 @@
+// p22_branch_storm: 大量短路 + 副作用调用
+int side(int x) { return x + 1; }
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 50000) {
+    if (side(i) > 0 && (i - (i / 2) * 2) == 0) s = s + 1;
+    if (side(i) > 100000 || (i - (i / 3) * 3) == 0) s = s + 2;
+    i = i + 1;
+  }
+  return s % 256;
+}

@@ -78,10 +78,13 @@ class FunctionEmitter {
 
     for (const auto &inst : func_.instructions) emitInst(inst);
     out_ << returnLabel() << ":\n";
-    emitLwReg("ra", -4, "s0");
-    emitLwReg("s0", -8, "s0");
+    // Restore callee-saved s-regs FIRST (while s0 still points at this frame),
+    // then ra, then s0 last — otherwise reloading s0 first invalidates the
+    // base register used for the rest of the lw's.
     for (std::size_t i = 0; i < savedSRegs_.size(); ++i)
       emitLwReg(savedSRegs_[i], -12 - static_cast<int>(i) * 4, "s0");
+    emitLwReg("ra", -4, "s0");
+    emitLwReg("s0", -8, "s0");
     emitAddSp(frameSize_);
     out_ << "  ret\n";
   }

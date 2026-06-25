@@ -1,0 +1,22 @@
+// p14_modpow: 模幂迭代版（避免数组）。考察循环 + div/mod 强度削减。
+// 用小模数以避免 32-bit 乘法溢出（gcc host int 是 64 bit）。
+int modpow(int a, int b, int m) {
+  int r = 1;
+  a = a % m;
+  while (b > 0) {
+    if (b - (b / 2) * 2 == 1) r = r * a % m;
+    a = a * a % m;
+    b = b / 2;
+  }
+  return r;
+}
+
+int main() {
+  int s = 0;
+  int i = 2;
+  while (i < 20) {
+    s = s + modpow(i, 30, 1009);
+    i = i + 1;
+  }
+  return s % 256;
+}

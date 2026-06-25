@@ -336,28 +336,42 @@ bool copyPropPass(ir::Function &fn) {
 
 // Basic-block local common-subexpression elimination. Reuses a previous
 // identical Binary's dest when same op & operands appear within a block.
+// Operands are compared by either slot id OR (when the slot is known to hold
+// a constant in this block) by constant value — so `i*3` and `i*3` match even
+// when the two `3`s were materialized into different slots by IR construction.
 bool csePass(ir::Function &fn) {
   bool any = false;
   for (auto itbeg = fn.instructions.begin(); itbeg != fn.instructions.end();) {
+    // value-numbering map: slot -> canonical key. For constants the key is
+    // encoded as a high-bit-tagged integer so it cannot collide with raw slot
+    // numbers; for non-constants it is just the slot id itself.
+    std::unordered_map<int, int> known;  // slot -> constant value
     std::unordered_map<uint64_t, int> seen;  // key -> dest slot
     auto cur = itbeg;
     while (cur != fn.instructions.end() && !isControlBoundary(*cur)) {
-      // boundary clears at Label/Goto/Branch/Return; Label restart handled below.
       if (cur->op == Op::Label) break;
       auto &inst = *cur;
+      if (inst.op == Op::Const) {
+        known[inst.dest] = inst.value;
+      }
+      // Encode operand: if slot is known-const, use a tagged value-key
+      // (high bit set is impossible for a non-negative slot id).
+      auto enc = [&](int slot) -> int {
+        auto it = known.find(slot);
+        if (it == known.end()) return slot;  // raw slot id
+        // mask to 24-bit constant value with top tag bit set
+        return 0x40000000 | (it->second & 0x3FFFFF);
+      };
       if (inst.op == Op::Binary) {
-        // Build a hash key for equality: low bit op, then operands (commutatively
-        // normalize Add/Mul so a+b == b+a).
         auto op = static_cast<int>(inst.binary);
-        int a = inst.lhs;
-        int b = inst.rhs;
+        int a = enc(inst.lhs);
+        int b = enc(inst.rhs);
         bool commute = (inst.binary == ir::BinaryOp::Add) || (inst.binary == ir::BinaryOp::Mul);
         if (commute && a > b) std::swap(a, b);
         uint64_t key =
-            (uint64_t)(op & 0xFFFF) << 48 | (uint64_t)(a & 0xFFFFFFFF) << 24 | (b & 0xFFFFFF);
+            (uint64_t)(op & 0xFFFF) << 48 | (uint64_t)(a & 0xFFFFFFFF) << 16 | (b & 0xFFFF);
         auto it = seen.find(key);
         if (it != seen.end()) {
-          // Replace this Binary with Move dest <- previous dest
           int prev = it->second;
           inst.op = Op::Move;
           inst.lhs = prev;
@@ -368,7 +382,6 @@ bool csePass(ir::Function &fn) {
           seen[key] = inst.dest;
         }
       }
-      // Track Move destination-aliases to allow CSE on copies too is omitted here.
       ++cur;
     }
     itbeg = (cur == fn.instructions.end()) ? cur : cur + 1;
@@ -376,11 +389,16 @@ bool csePass(ir::Function &fn) {
   return any;
 }
 
-// Copy-coalesce: when `Move d <- s` and slot s is defined exactly once by a pure
-// recipe (Const/Unary/Binary/LoadGlobal) and used exactly once (this Move),
-// re-target that single def to write d instead of s, then drop the Move.
-// Reduces per-iteration sw/lw churn for expressions like `s = s + i` that
-// otherwise materialize a temp.
+// Copy-coalesce: when `Move d <- s` immediately follows a pure def of s, and s
+// is used exactly once (this Move), re-target the def to write d directly.
+//
+// Soundness condition: the def must immediately precede the Move (no
+// intervening instruction may read or write d, otherwise advancing the
+// store-to-d corrupts the value an in-between read of d expected). Counter-
+// example caught by p19_gcd_pairs: `t = a - (a/b)*b; a = b; b = t;` — here
+// the binary defining t is two Moves before `Move b <- t`, with `Move a <- b`
+// in between. Coalescing t into b would store t into b before `a = b` reads
+// b, breaking the swap idiom.
 bool copyCoalescePass(ir::Function &fn) {
   bool any = false;
   bool changed = true;
@@ -398,7 +416,8 @@ bool copyCoalescePass(ir::Function &fn) {
     }
     // Pass 1: pick coalescable moves (s -> d). Record one re-target per s.
     std::unordered_map<int, int> retarget;  // s -> d
-    for (const auto &inst : fn.instructions) {
+    for (std::size_t mi = 0; mi < fn.instructions.size(); ++mi) {
+      const auto &inst = fn.instructions[mi];
       if (inst.op != Op::Move) continue;
       const int s = inst.lhs;
       const int d = inst.dest;
@@ -407,6 +426,9 @@ bool copyCoalescePass(ir::Function &fn) {
       auto dit = singleDef.find(s);
       if (uit == uses.end() || uit->second != 1) continue;
       if (dit == singleDef.end() || dit->second == static_cast<std::size_t>(-1)) continue;
+      // Adjacency requirement: the def must be the instruction right before
+      // this Move, so nothing reads or writes d in between.
+      if (dit->second + 1 != mi) continue;
       const Inst &def = fn.instructions[dit->second];
       if (def.op != Op::Const && def.op != Op::Unary &&
           def.op != Op::Binary && def.op != Op::LoadGlobal) continue;
