@@ -290,15 +290,27 @@ class FunctionEmitter {
     for (std::size_t i = 0; i < func_.instructions.size(); ++i) {
       const auto &inst = func_.instructions[i];
       if (inst.dest == -1 || !oneReadOneDefTemps.count(inst.dest)) continue;
-      // 仅对 Binary/Unary/Const 的 dest 启用：它们都把结果留在 a0。
-      // Move/LoadGlobal/Call 不计——Call 在自身后清空 cache。
       if (inst.op != ir::Instruction::Op::Binary &&
           inst.op != ir::Instruction::Op::Unary &&
           inst.op != ir::Instruction::Op::Const) continue;
       const int defSlot = inst.dest;
+      // 向后跳过 Label 与"会被 backend 完全省略"的 Const 指令（它们的
+      // dest 已在 slotConst_ 且非 regAllocated；loadSlot 后续直接 li，不
+      // 会侵犯 cache）。
       std::size_t j = i + 1;
-      while (j < func_.instructions.size() &&
-             func_.instructions[j].op == ir::Instruction::Op::Label) ++j;
+      while (j < func_.instructions.size()) {
+        const auto &mid = func_.instructions[j];
+        if (mid.op == ir::Instruction::Op::Label) { ++j; continue; }
+        if (mid.op == ir::Instruction::Op::Const) {
+          int cv = 0;
+          if (mid.dest != -1 && slotConst_.count(mid.dest) &&
+              slotConst_[mid.dest] == mid.value &&
+              !regMap_.count(mid.dest)) {
+            ++j; continue;  // 这个 Const 不会发射任何指令，可越过
+          }
+        }
+        break;
+      }
       if (j == func_.instructions.size()) continue;
       const auto &nx = func_.instructions[j];
       bool ok = false;
@@ -311,9 +323,6 @@ class FunctionEmitter {
           ok = (nx.lhs == defSlot);
           break;
         case ir::Instruction::Op::Binary:
-          // Binary loadSlot 先 lhs 入 t0、再 rhs 入 a0。若 defSlot 是 lhs，
-          // cache 命中把 a0 → t0；接着 rhs 加载可能覆盖 a0，没关系（temp
-          // 不再被需要）。若 defSlot 是 rhs，loadSlot rhs 也命中。安全。
           ok = (nx.lhs == defSlot) || (nx.rhs == defSlot);
           break;
         default:
