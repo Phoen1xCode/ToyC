@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <queue>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -114,13 +115,6 @@ int foldConstBinary(ir::BinaryOp op, int a, int b) {
     case ir::BinaryOp::Mod: return b == 0 ? 0 : a % b;
   }
   return 0;
-}
-
-bool isPowerOfTwo(int v) { return v > 0 && (v & (v - 1)) == 0; }
-int logPowerOfTwo(int v) {  // requires power of 2
-  int r = 0;
-  while ((1 << r) < v) ++r;
-  return r;
 }
 
 // Basic-block local constant folding + algebraic simplification.
@@ -466,9 +460,337 @@ void optimizeFunction(ir::Function &fn) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Function inlining.
+//
+// Operates on the flat per-function instruction list. A Call to a small,
+// loop-free, non-recursive, side-effect-free callee is expanded in place:
+//   - callee body instructions are copied with every slot shifted by a
+//     fresh base offset so they cannot collide with the caller's slots;
+//   - reads of a callee paramSlot are rewritten to the corresponding
+//     caller-side argument slot (direct argument substitution — no Move);
+//   - callee `Return lhs` becomes `Move callDest <- retSlot; Goto next`;
+//     `ReturnVoid` becomes `Goto next`.
+// After inlining, the existing local passes (constFold/copyProp/dce) clean
+// up: when all arguments are constants, the callee body folds to a single
+// Const — this is how `compute(5,7,11)` collapses to `return 122`.
+//
+// Recursion is handled with a call graph + Tarjan SCC: any function in a
+// cycle (including direct self-recursion) is never inlined, so expansion
+// always terminates. Purity: a function with a StoreGlobal is still inlinable
+// (moving the store into the caller is semantically equivalent), but a
+// function that itself contains a Call is only inlined if that nested callee
+// is also inlinable-and-already-inlined — to keep this pass simple and
+// terminating we refuse to inline any function that contains a Call to a
+// function not yet confirmed leaf. In practice we just refuse functions
+// containing any Call at all (leaf-only inlining), which covers the perf
+// cases (compute, adj) and stays safe.
+
+// Collect the set of callee names referenced by `fn`.
+std::unordered_set<std::string> calleesOf(const ir::Function &fn) {
+  std::unordered_set<std::string> out;
+  for (const auto &i : fn.instructions)
+    if (i.op == Op::Call) out.insert(i.name);
+  return out;
+}
+
+// Does `fn` contain a loop? The IR builder lowers `while` to a fixed label
+// pattern `.L_<fn>_while_cond_N` / `_while_body_N` / `_while_end_N` with a
+// `Goto condLabel` at the end of the body. A back-edge (a Goto whose target
+// Label appears *earlier* than the Goto) is a reliable loop signal without
+// needing a full CFG.
+bool hasLoop(const ir::Function &fn) {
+  std::unordered_map<std::string, std::size_t> labelPos;
+  for (std::size_t i = 0; i < fn.instructions.size(); ++i)
+    if (fn.instructions[i].op == Op::Label) labelPos[fn.instructions[i].label] = i;
+  for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
+    const auto &inst = fn.instructions[i];
+    if (inst.op == Op::Goto) {
+      auto it = labelPos.find(inst.label);
+      if (it != labelPos.end() && it->second <= i) return true;
+    }
+  }
+  return false;
+}
+
+// Is `fn` a leaf (contains no Call)? Leaf-only inlining keeps termination
+// trivial and covers the hot cases (compute, adj).
+bool isLeaf(const ir::Function &fn) {
+  for (const auto &i : fn.instructions)
+    if (i.op == Op::Call) return false;
+  return true;
+}
+
+// Tarjan SCC over the call graph to find functions involved in any cycle.
+// Returns the set of function names that are *not* inlinable due to being
+// in a recursive cycle (self-recursion or mutual). A function that calls
+// itself directly is its own cycle.
+std::unordered_set<std::string> findRecursive(const std::vector<ir::Function> &fns) {
+  std::unordered_map<std::string, int> id;
+  std::vector<std::string> names;
+  for (const auto &f : fns) {
+    if (id.count(f.name)) continue;
+    id[f.name] = static_cast<int>(names.size());
+    names.push_back(f.name);
+  }
+  const int n = static_cast<int>(names.size());
+  std::vector<std::vector<int>> adj(n);
+  for (const auto &f : fns) {
+    int u = id[f.name];
+    for (const auto &c : calleesOf(f)) {
+      auto it = id.find(c);
+      if (it != id.end()) adj[u].push_back(it->second);
+    }
+  }
+  // Tarjan
+  std::vector<int> idx(n, -1), low(n, 0), onStack(n, 0);
+  std::vector<int> stack;
+  int index = 0;
+  std::unordered_set<std::string> inCycle;
+  // iterative Tarjan to avoid deep recursion on large call graphs
+  for (int s = 0; s < n; ++s) {
+    if (idx[s] != -1) continue;
+    std::vector<std::pair<int, int>> work;  // (node, nextNeighborIndex)
+    work.push_back({s, 0});
+    while (!work.empty()) {
+      auto &top = work.back();
+      int v = top.first;
+      if (idx[v] == -1) {
+        idx[v] = low[v] = index++;
+        stack.push_back(v);
+        onStack[v] = 1;
+      }
+      if (top.second < static_cast<int>(adj[v].size())) {
+        int w = adj[v][top.second++];
+        if (idx[w] == -1) {
+          work.push_back({w, 0});
+          continue;
+        }
+        if (onStack[w]) low[v] = std::min(low[v], idx[w]);
+      } else {
+        if (low[v] == idx[v]) {
+          // pop SCC rooted at v
+          std::vector<int> comp;
+          int w;
+          do {
+            w = stack.back();
+            stack.pop_back();
+            onStack[w] = 0;
+            comp.push_back(w);
+          } while (w != v);
+          if (comp.size() > 1) {
+            for (int c : comp) inCycle.insert(names[c]);
+          } else {
+            // singleton — still recursive if it calls itself
+            int c = comp[0];
+            for (int nb : adj[c])
+              if (nb == c) { inCycle.insert(names[c]); break; }
+          }
+        }
+        work.pop_back();
+        if (!work.empty()) {
+          int parent = work.back().first;
+          low[parent] = std::min(low[parent], low[v]);
+        }
+      }
+    }
+  }
+  return inCycle;
+}
+
+// Rewrite every slot operand of `inst` that is a callee paramSlot to the
+// corresponding caller argument slot, using `paramToArg`. Non-param slots are
+// shifted by `base`.
+void remapInstSlots(Inst &inst, int base,
+                    const std::unordered_map<int, int> &paramToArg) {
+  auto xform = [&](int s) -> int {
+    if (s == -1) return s;
+    auto it = paramToArg.find(s);
+    if (it != paramToArg.end()) return it->second;
+    return s + base;
+  };
+  if (inst.op == Op::StoreGlobal) {
+    inst.lhs = xform(inst.lhs);
+    return;
+  }
+  if (inst.op == Op::Branch) {
+    inst.lhs = xform(inst.lhs);
+    return;
+  }
+  if (inst.op == Op::Return) {
+    inst.lhs = xform(inst.lhs);
+    return;
+  }
+  if (inst.op == Op::Move || inst.op == Op::Unary) {
+    inst.lhs = xform(inst.lhs);
+    inst.dest = xform(inst.dest);
+    return;
+  }
+  if (inst.op == Op::Binary) {
+    inst.lhs = xform(inst.lhs);
+    inst.rhs = xform(inst.rhs);
+    inst.dest = xform(inst.dest);
+    return;
+  }
+  if (inst.op == Op::Const) {
+    inst.dest = xform(inst.dest);
+    return;
+  }
+  if (inst.op == Op::LoadGlobal) {
+    inst.dest = xform(inst.dest);
+    return;
+  }
+  if (inst.op == Op::Call) {
+    for (auto &a : inst.args) a = xform(a);
+    inst.dest = xform(inst.dest);
+    return;
+  }
+  // Label/Goto/ReturnVoid have no slots.
+}
+
+// Inline every inlinable Call inside `caller` using the function table
+// `byName`. Returns true if any Call was inlined. Mutates `caller` in place.
+// `inlinable` precomputed per callee name.
+bool inlineCallsInFunction(
+    ir::Function &caller,
+    const std::unordered_map<std::string, const ir::Function *> &byName,
+    const std::unordered_set<std::string> &inlinable) {
+  bool any = false;
+  // iterate to fixed point: inlining may expose new calls? No — we only
+  // inline leaf callees, so inlining a leaf cannot introduce new Calls.
+  // But a single pass may have multiple call sites; rebuild once.
+  std::vector<Inst> out;
+  out.reserve(caller.instructions.size());
+  for (std::size_t i = 0; i < caller.instructions.size(); ++i) {
+    const auto &inst = caller.instructions[i];
+    if (inst.op != Op::Call) {
+      out.push_back(inst);
+      continue;
+    }
+    auto it = byName.find(inst.name);
+    if (it == byName.end() || !inlinable.count(inst.name)) {
+      out.push_back(inst);
+      continue;
+    }
+    const ir::Function &callee = *it->second;
+    // Build paramSlot -> caller arg slot map (direct substitution).
+    std::unordered_map<int, int> paramToArg;
+    const std::size_t nargs = std::min(callee.paramSlots.size(), inst.args.size());
+    for (std::size_t k = 0; k < nargs; ++k)
+      paramToArg[callee.paramSlots[k]] = inst.args[k];
+    // Fresh slot base for callee temps/locals.
+    const int base = caller.slotCount;
+    caller.slotCount += callee.slotCount;
+    // Drop callee paramSlots from the shifted range: their reads are
+    // substituted, but a callee may also *write* its paramSlot (e.g.
+    // `i1 = i1 / 3`). That write must go to a fresh slot, not back to the
+    // caller's arg slot. So if a paramSlot is ever defined in the callee,
+    // we cannot substitute its reads after the def. Handle by making the
+    // param slot map to a fresh slot, then emit a `Move fresh <- arg` at
+    // the entry so the initial value is the argument.
+    std::unordered_map<int, int> effectiveParam = paramToArg;
+    // Detect which paramSlots are reassigned inside the callee.
+    for (int p : callee.paramSlots) {
+      bool reassigned = false;
+      for (const auto &ci : callee.instructions) {
+        if (definesSlot(ci) && ci.dest == p) { reassigned = true; break; }
+      }
+      if (reassigned) {
+        int fresh = caller.slotCount++;
+        effectiveParam[p] = fresh;
+        // emit Move fresh <- arg (so the initial value equals the argument)
+        Inst mv;
+        mv.op = Op::Move;
+        mv.dest = fresh;
+        mv.lhs = paramToArg[p];
+        out.push_back(mv);
+      }
+    }
+    // Fresh label for the continuation after the inlined body.
+    std::string cont = ".L_" + caller.name + "_inline_" +
+                       std::to_string(caller.instructions.size()) + "_" +
+                       std::to_string(i);
+    // Copy callee body, remap slots, convert Return/ReturnVoid.
+    for (const auto &ci : callee.instructions) {
+      Inst copy = ci;
+      remapInstSlots(copy, base, effectiveParam);
+      if (copy.op == Op::Return) {
+        Inst mv;
+        mv.op = Op::Move;
+        mv.dest = inst.dest;  // the Call's dest slot in the caller
+        mv.lhs = copy.lhs;
+        out.push_back(mv);
+        Inst g;
+        g.op = Op::Goto;
+        g.label = cont;
+        out.push_back(g);
+      } else if (copy.op == Op::ReturnVoid) {
+        Inst g;
+        g.op = Op::Goto;
+        g.label = cont;
+        out.push_back(g);
+      } else {
+        out.push_back(copy);
+      }
+    }
+    out.push_back({});  // Label cont
+    out.back().op = Op::Label;
+    out.back().label = cont;
+    any = true;
+  }
+  if (any) caller.instructions = std::move(out);
+  return any;
+}
+
 }  // namespace
 
+// Program-level inlining driver. First runs local passes on every function
+// so dead args / dead locals shrink callee bodies (a DCE-heavy callee like
+// `void func(i){ int x1=1;...; global=i; }` collapses to one store and
+// becomes cheap to inline). Then marks leaf, loop-free, non-recursive,
+// small callees as inlinable, inlines their call sites, and re-runs local
+// passes so folded constants / dead defs from inlining are cleaned up.
+// The outer loop repeats: inlining can turn a caller into a leaf that is
+// now itself inlinable elsewhere.
+void inlineProgram(ir::Program &program) {
+  constexpr int kMaxBody = 400;  // callee body instruction budget (post-cleanup)
+  const auto recursive = findRecursive(program.functions);
+  std::unordered_map<std::string, const ir::Function *> byName;
+  for (const auto &f : program.functions) byName[f.name] = &f;
+
+  // Pre-shrink every function with local passes so inlinability is judged on
+  // the optimized body, not the raw IR (DCE removes dead locals, constFold
+  // folds constant arg-driven computations, etc.).
+  for (auto &f : program.functions) optimizeFunction(f);
+  byName.clear();
+  for (auto &f : program.functions) byName[f.name] = &f;
+
+  for (int outer = 0; outer < 6; ++outer) {
+    // Mark inlinable callees based on current (post-cleanup) bodies.
+    std::unordered_set<std::string> inlinable;
+    for (const auto &f : program.functions) {
+      if (recursive.count(f.name)) continue;
+      if (!isLeaf(f)) continue;
+      if (hasLoop(f)) continue;
+      if (f.instructions.size() > kMaxBody) continue;
+      inlinable.insert(f.name);
+    }
+    // Inline in callers; rebuild each caller once per sweep.
+    bool any = false;
+    for (auto &f : program.functions) any |= inlineCallsInFunction(f, byName, inlinable);
+    if (!any) break;
+    // Cleanup so the next outer iteration judges shrunken bodies and so
+    // inlined constants fold.
+    for (auto &f : program.functions) optimizeFunction(f);
+    byName.clear();
+    for (auto &f : program.functions) byName[f.name] = &f;
+  }
+}
+
 void optimizeProgram(ir::Program &program) {
+  inlineProgram(program);
+  // Local passes already ran inside inlineProgram; one final sweep ensures a
+  // fixed point.
   for (auto &fn : program.functions) optimizeFunction(fn);
 }
 
