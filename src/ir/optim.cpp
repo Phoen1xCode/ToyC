@@ -827,14 +827,42 @@ bool inlineCallsInFunction(
         out.push_back(mv);
       }
     }
-    // Fresh label for the continuation after the inlined body.
-    std::string cont = ".L_" + caller.name + "_inline_" +
-                       std::to_string(caller.instructions.size()) + "_" +
-                       std::to_string(i);
-    // Copy callee body, remap slots, convert Return/ReturnVoid.
+    // Fresh label for the continuation after the inlined body. Use a
+    // program-unique counter so that when THIS caller is itself inlined
+    // elsewhere later, the continuation label (and every label inside the
+    // callee body) cannot collide with labels already in the caller or in
+    // other functions.
+    static std::size_t globalInlineId = 0;
+    const std::size_t siteId = globalInlineId++;
+    const std::string cont = ".L_inl" + std::to_string(siteId) + "_cont";
+    // Build a rename map for every label defined in the callee body. Each
+    // gets a fresh unique name so that copying the body into the caller
+    // cannot duplicate a label that the callee still owns (the callee remains
+    // emitted as a standalone function), nor collide with labels from other
+    // inline sites.
+    std::unordered_map<std::string, std::string> labelRename;
+    {
+      std::size_t labelIdx = 0;
+      for (const auto &ci : callee.instructions)
+        if (ci.op == Op::Label && !ci.label.empty()) {
+          if (labelRename.emplace(ci.label,
+              ".L_inl" + std::to_string(siteId) + "_l" + std::to_string(labelIdx++)).second) {
+            // ok
+          }
+        }
+    }
+    auto renameLabel = [&](std::string &s) {
+      if (s.empty()) return;
+      auto it = labelRename.find(s);
+      if (it != labelRename.end()) s = it->second;
+    };
+    // Copy callee body, remap slots, rename labels, convert Return/ReturnVoid.
     for (const auto &ci : callee.instructions) {
       Inst copy = ci;
       remapInstSlots(copy, base, effectiveParam);
+      if (copy.op == Op::Label) renameLabel(copy.label);
+      else if (copy.op == Op::Goto) renameLabel(copy.label);
+      else if (copy.op == Op::Branch) { renameLabel(copy.label); renameLabel(copy.falseLabel); }
       if (copy.op == Op::Return) {
         Inst mv;
         mv.op = Op::Move;
