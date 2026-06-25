@@ -1,0 +1,42 @@
+// p28_div_const: 除法强度削减 (div/rem by 常数)
+// 改写自 compiler2021/performance_test2021-private/integer-divide-optimization-1.sy
+// func 20 个参数各 /3，return 累加；main 内层 j<40 调用 func(i*3,...) / size。考察非 2 幂除法 magic number。
+int func(int i1, int i2, int i3, int i4, int i5, int i6, int i7, int i8, int i9, int i10, int i11, int i12, int i13, int i14, int i15, int i16, int i17, int i18, int i19, int i20) {
+  i1 = i1 / 3;
+  i2 = i2 / 3;
+  i3 = i3 / 3;
+  i4 = i4 / 3;
+  i5 = i5 / 3;
+  i6 = i6 / 3;
+  i7 = i7 / 3;
+  i8 = i8 / 3;
+  i9 = i9 / 3;
+  i10 = i10 / 3;
+  i11 = i11 / 3;
+  i12 = i12 / 3;
+  i13 = i13 / 3;
+  i14 = i14 / 3;
+  i15 = i15 / 3;
+  i16 = i16 / 3;
+  i17 = i17 / 3;
+  i18 = i18 / 3;
+  i19 = i19 / 3;
+  i20 = i20 / 3;
+  return i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9 + i10 + i11 + i12 + i13 + i14 + i15 + i16 + i17 + i18 + i19 + i20;
+}
+int main() {
+  int sum = 0;
+  int i = 0;
+  while (i < 200) {
+    int tmp = 0;
+    int j = 0;
+    while (j < 40) {
+      tmp = tmp + func(i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3, i * 3) / 20;
+      j = j + 1;
+    }
+    sum = sum + tmp;
+    sum = sum % 2147385347;
+    i = i + 1;
+  }
+  return sum % 256;
+}

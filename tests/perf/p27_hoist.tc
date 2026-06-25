@@ -1,0 +1,29 @@
+// p27_hoist: 循环不变量外提 (LICM)
+// 改写自 compiler2021/performance_test2021-private/hoist-1.sy
+// func 8 个不变参数，循环体内 sum=sum+i1+...+i8 重复 10 遍；考察循环不变量外提。
+int func(int i1, int i2, int i3, int i4, int i5, int i6, int i7, int i8) {
+  int result = 0;
+  int i = 0;
+  while (i < 30000) {
+    int sum = 0;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum + i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8;
+    sum = sum / 100;
+    result = result + sum;
+    result = result % 1500000001;
+    i = i + 1;
+  }
+  return result;
+}
+int main() {
+  int result = func(1, 1, 1, 1, 1, 1, 1, 1);
+  return result % 256;
+}

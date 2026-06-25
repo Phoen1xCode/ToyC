@@ -1,0 +1,103 @@
+// p29_inst_combine: 指令合并 / 窥孔 (input=input+1 重复)
+// 改写自 compiler2021/performance_test2021-private/instruction-combining-1.sy
+// func 内 input=input+1 重复 80 次，main 内层 j<60 调用 func(i,10000)。考察 +1 重复合并为 +k。
+int func(int input, int size) {
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  input = input + 1;
+  return input;
+}
+int main() {
+  int sum = 0;
+  int i = 0;
+  while (i < 128) {
+    int tmp = 0;
+    int j = 0;
+    while (j < 60) {
+      tmp = tmp + func(i, 10000);
+      j = j + 1;
+    }
+    tmp = tmp / 60;
+    sum = sum + tmp;
+    sum = sum % 536854529;
+    i = i + 1;
+  }
+  return sum % 256;
+}
