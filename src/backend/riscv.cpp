@@ -665,42 +665,87 @@ class FunctionEmitter {
     }
 
     // -------- 通用回退 ----------
-    loadSlot("t0", inst.lhs);
-    loadSlot("a0", inst.rhs);
+    // 决定操作数最终所在的寄存器。优先复用 slot 当前的寄存器位置；若必须
+    // 加载，安排到不会冲突的临时寄存器。
+    const std::string lhsHere = slotInReg(inst.lhs);
+    const std::string rhsHere = slotInReg(inst.rhs);
+    std::string t0Src;  // lhs operand reg
+    std::string a0Src;  // rhs operand reg
+
+    if (!lhsHere.empty() && !rhsHere.empty()) {
+      // 两个操作数都已在寄存器中。t0Src 不能等于 a0（killReg("a0") 会丢值）
+      // 之外，直接用之即可。注意 lhsHere == rhsHere（同一 s-reg 来源）也安全
+      // ——op 允许两个 source 相同。
+      if (lhsHere == "a0") {
+        // 即将写 a0；为避免覆盖输入，搬到 t0。
+        out_ << "  mv t0, a0\n";
+        t0Src = "t0";
+      } else {
+        t0Src = lhsHere;
+      }
+      a0Src = rhsHere;
+    } else if (!lhsHere.empty()) {
+      // lhs 在 reg；rhs 需 load 到 a0（结果也写 a0 不冲突，因 rhs 是输入端
+      // 先消费才被覆盖——但 RISC-V 三操作数允许）。
+      if (lhsHere == "a0") {
+        out_ << "  mv t0, a0\n";
+        t0Src = "t0";
+      } else {
+        t0Src = lhsHere;
+      }
+      loadSlot("a0", inst.rhs);
+      a0Src = "a0";
+    } else if (!rhsHere.empty()) {
+      // rhs 在 reg；lhs 需 load。把 lhs 放 t0。要小心 load 不要破坏 rhsHere：
+      // loadSlot("t0", ...) 只 dropReg("t0")。但若 rhsHere == "t0"，load 会
+      // 覆盖它——这种情况先把 rhs 搬到 a0 再 load lhs。
+      if (rhsHere == "t0") {
+        out_ << "  mv a0, t0\n";
+        a0Src = "a0";
+      } else {
+        a0Src = rhsHere;
+      }
+      loadSlot("t0", inst.lhs);
+      t0Src = "t0";
+    } else {
+      loadSlot("t0", inst.lhs);
+      loadSlot("a0", inst.rhs);
+      t0Src = "t0"; a0Src = "a0";
+    }
     killReg("a0");  // binary op overwrites a0
     switch (inst.binary) {
       case ir::BinaryOp::Less:
-        out_ << "  slt a0, t0, a0\n";
+        out_ << "  slt a0, " << t0Src << ", " << a0Src << "\n";
         break;
       case ir::BinaryOp::Greater:
-        out_ << "  slt a0, a0, t0\n";
+        out_ << "  slt a0, " << a0Src << ", " << t0Src << "\n";
         break;
       case ir::BinaryOp::LessEqual:
-        out_ << "  slt a0, a0, t0\n  xori a0, a0, 1\n";
+        out_ << "  slt a0, " << a0Src << ", " << t0Src << "\n  xori a0, a0, 1\n";
         break;
       case ir::BinaryOp::GreaterEqual:
-        out_ << "  slt a0, t0, a0\n  xori a0, a0, 1\n";
+        out_ << "  slt a0, " << t0Src << ", " << a0Src << "\n  xori a0, a0, 1\n";
         break;
       case ir::BinaryOp::Equal:
-        out_ << "  sub a0, t0, a0\n  seqz a0, a0\n";
+        out_ << "  sub a0, " << t0Src << ", " << a0Src << "\n  seqz a0, a0\n";
         break;
       case ir::BinaryOp::NotEqual:
-        out_ << "  sub a0, t0, a0\n  snez a0, a0\n";
+        out_ << "  sub a0, " << t0Src << ", " << a0Src << "\n  snez a0, a0\n";
         break;
       case ir::BinaryOp::Add:
-        out_ << "  add a0, t0, a0\n";
+        out_ << "  add a0, " << t0Src << ", " << a0Src << "\n";
         break;
       case ir::BinaryOp::Sub:
-        out_ << "  sub a0, t0, a0\n";
+        out_ << "  sub a0, " << t0Src << ", " << a0Src << "\n";
         break;
       case ir::BinaryOp::Mul:
-        out_ << "  mul a0, t0, a0\n";
+        out_ << "  mul a0, " << t0Src << ", " << a0Src << "\n";
         break;
       case ir::BinaryOp::Div:
-        out_ << "  div a0, t0, a0\n";
+        out_ << "  div a0, " << t0Src << ", " << a0Src << "\n";
         break;
       case ir::BinaryOp::Mod:
-        out_ << "  rem a0, t0, a0\n";
+        out_ << "  rem a0, " << t0Src << ", " << a0Src << "\n";
         break;
     }
     storeSlot("a0", inst.dest);
