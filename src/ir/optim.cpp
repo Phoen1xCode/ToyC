@@ -244,6 +244,174 @@ bool constFoldPass(ir::Function &fn) {
   return any;
 }
 
+// Fold `Branch lhs=known-const` into `Goto target` (or delete if fall-through).
+// Tracks BB-local known constants the same way constFoldPass does; runs after
+// constFoldPass so that `Move d <- s` (s const) has already been rewritten to
+// `Const d=v`, making more Branch conditions locally-constant.
+//
+// Branch semantics (from backend emitInst): `bnez a0, label` then
+// `beqz a0, falseLabel`. Either label may be empty (fall-through). For the
+// while-loop pattern `emitBranch(cond, endLabel)` with onTrue=false, label is
+// empty and falseLabel is endLabel — "if cond is false, jump to end; else
+// fall through to body".
+//
+// When the condition is known:
+//   v == 0 (false): take falseLabel; if falseLabel empty, fall through (delete).
+//   v != 0 (true):  take label;       if label empty,       fall through (delete).
+bool branchFoldPass(ir::Function &fn) {
+  bool any = false;
+  std::unordered_map<int, int> known;
+  std::vector<Inst> kept;
+  kept.reserve(fn.instructions.size());
+  auto clearDef = [&](int slot) {
+    if (slot != -1) known.erase(slot);
+  };
+  for (auto &i : fn.instructions) {
+    if (i.op == Op::Label) {
+      known.clear();
+      kept.push_back(i);
+      continue;
+    }
+    if (i.op == Op::Branch && i.lhs != -1) {
+      auto it = known.find(i.lhs);
+      if (it != known.end()) {
+        int v = it->second;
+        const std::string &target = (v == 0) ? i.falseLabel : i.label;
+        if (!target.empty()) {
+          Inst g;
+          g.op = Op::Goto;
+          g.label = target;
+          kept.push_back(g);
+        }
+        // else: fall-through — drop the Branch entirely.
+        any = true;
+        known.clear();
+        continue;
+      }
+      known.clear();
+      kept.push_back(i);
+      continue;
+    }
+    // Update known (mirrors constFoldPass; only the slots, not the rewrites).
+    switch (i.op) {
+      case Op::Const:
+        known[i.dest] = i.value;
+        break;
+      case Op::Move: {
+        clearDef(i.dest);
+        auto it = known.find(i.lhs);
+        if (it != known.end()) known[i.dest] = it->second;
+        break;
+      }
+      case Op::Unary: {
+        clearDef(i.dest);
+        auto it = known.find(i.lhs);
+        if (it != known.end())
+          known[i.dest] = foldConstUnary(i.unary, it->second);
+        break;
+      }
+      case Op::Binary: {
+        clearDef(i.dest);
+        auto lk = known.find(i.lhs);
+        auto rk = known.find(i.rhs);
+        if (lk != known.end() && rk != known.end())
+          known[i.dest] = foldConstBinary(i.binary, lk->second, rk->second);
+        break;
+      }
+      case Op::LoadGlobal:
+      case Op::Call:
+        clearDef(i.dest);
+        break;
+      case Op::Goto:
+      case Op::Return:
+      case Op::ReturnVoid:
+        known.clear();
+        break;
+      default:
+        break;
+    }
+    kept.push_back(i);
+  }
+  if (any) fn.instructions = std::move(kept);
+  return any;
+}
+
+// Remove unreachable basic blocks via CFG reachability from the function entry.
+// A block is reachable if it's the entry (instruction 0), the target of a
+// Goto/Branch, OR reached by fall-through from a Branch with an empty side
+// (or from any non-control-flow instruction). The prior implementation only
+// counted Goto/Branch targets, which missed fall-through-reached blocks like
+// `while_body` (the Branch's true-side is fall-through when label is empty),
+// causing the entire loop body to be dropped.
+bool deadBlockPass(ir::Function &fn) {
+  if (fn.instructions.empty()) return false;
+  std::unordered_map<std::string, std::size_t> labelPos;
+  for (std::size_t i = 0; i < fn.instructions.size(); ++i)
+    if (fn.instructions[i].op == Op::Label)
+      labelPos[fn.instructions[i].label] = i;
+  std::vector<bool> reachable(fn.instructions.size(), false);
+  std::queue<std::size_t> worklist;
+  worklist.push(0);
+  while (!worklist.empty()) {
+    std::size_t idx = worklist.front();
+    worklist.pop();
+    if (idx >= fn.instructions.size() || reachable[idx]) continue;
+    reachable[idx] = true;
+    const auto &inst = fn.instructions[idx];
+    auto pushLabel = [&](const std::string &lbl) {
+      auto it = labelPos.find(lbl);
+      if (it != labelPos.end()) worklist.push(it->second);
+    };
+    switch (inst.op) {
+      case Op::Goto:
+        pushLabel(inst.label);
+        break;
+      case Op::Branch:
+        // Each side either jumps to its label or falls through to idx+1.
+        if (!inst.label.empty()) pushLabel(inst.label);
+        else worklist.push(idx + 1);
+        if (!inst.falseLabel.empty()) pushLabel(inst.falseLabel);
+        else worklist.push(idx + 1);
+        break;
+      case Op::Return:
+      case Op::ReturnVoid:
+        break;
+      default:
+        worklist.push(idx + 1);
+        break;
+    }
+  }
+  std::vector<Inst> kept;
+  bool any = false;
+  for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
+    if (reachable[i]) kept.push_back(fn.instructions[i]);
+    else any = true;
+  }
+  if (any) fn.instructions = std::move(kept);
+  return any;
+}
+
+// Drop `Goto X` immediately followed by `Label X` (jump to the next
+// instruction is a no-op). Common after branchFoldPass converts a Branch to
+// `Goto falseLabel` where falseLabel happens to be the next Label.
+bool gotoCleanupPass(ir::Function &fn) {
+  bool any = false;
+  std::vector<Inst> kept;
+  kept.reserve(fn.instructions.size());
+  for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
+    const auto &inst = fn.instructions[i];
+    if (inst.op == Op::Goto && i + 1 < fn.instructions.size() &&
+        fn.instructions[i + 1].op == Op::Label &&
+        fn.instructions[i + 1].label == inst.label) {
+      any = true;
+      continue;
+    }
+    kept.push_back(inst);
+  }
+  if (any) fn.instructions = std::move(kept);
+  return any;
+}
+
 // Basic-block local copy propagation. When `Move d <- s`, subsequent reads of d
 // within the same basic block can substitute s. Aliases become stale when a
 // affected slot is redefined. Returns true if any operand was rewritten.
@@ -507,24 +675,31 @@ bool licmPass(ir::Function &fn) {
   bool changed = true;
   while (changed) {
     changed = false;
-    std::unordered_map<std::string, std::size_t> labelPos;
-    for (std::size_t i = 0; i < fn.instructions.size(); ++i)
-      if (fn.instructions[i].op == Op::Label) labelPos[fn.instructions[i].label] = i;
 
     for (std::size_t ci = 0; ci < fn.instructions.size(); ++ci) {
       if (fn.instructions[ci].op != Op::Label) continue;
       if (fn.instructions[ci].label.find("_while_cond_") == std::string::npos) continue;
-      std::string endLab;
-      std::size_t bi = ci + 1;
-      for (; bi < fn.instructions.size(); ++bi) {
-        const auto &x = fn.instructions[bi];
-        if (x.op == Op::Branch) { endLab = x.falseLabel; break; }
-        if (x.op == Op::Goto || x.op == Op::Return || x.op == Op::ReturnVoid) break;
+      // Find the matching `_while_end_` Label by scanning forward with nesting
+      // tracking. Robust to the while-condition Branch being deleted (e.g., by
+      // branchFoldPass folding `while (1)` to fall-through). The prior approach
+      // took the first Branch's falseLabel as endLab, which broke when that
+      // Branch was removed — LICM would then find an if-condition Branch
+      // inside the body and misidentify the loop range, hoisting non-invariant
+      // instructions like `i >= N` to before the loop.
+      std::size_t endIdx = std::size_t(-1);
+      int nesting = 0;
+      for (std::size_t j = ci + 1; j < fn.instructions.size(); ++j) {
+        const auto &x = fn.instructions[j];
+        if (x.op != Op::Label) continue;
+        const std::string &lbl = x.label;
+        if (lbl.find("_while_cond_") != std::string::npos) {
+          ++nesting;
+        } else if (lbl.find("_while_end_") != std::string::npos) {
+          if (nesting == 0) { endIdx = j; break; }
+          --nesting;
+        }
       }
-      if (endLab.empty()) continue;
-      auto endIt = labelPos.find(endLab);
-      if (endIt == labelPos.end()) continue;
-      const std::size_t endIdx = endIt->second;
+      if (endIdx == std::size_t(-1)) continue;
       if (endIdx <= ci + 1) continue;
       std::size_t bodyIdx = ci + 1;
       for (std::size_t j = ci + 1; j < endIdx; ++j) {
@@ -765,6 +940,9 @@ void optimizeFunction(ir::Function &fn) {
   for (int iter = 0; iter < 16; ++iter) {
     bool any = false;
     any |= constFoldPass(fn);
+    any |= branchFoldPass(fn);
+    any |= deadBlockPass(fn);
+    any |= gotoCleanupPass(fn);
     any |= copyPropPass(fn);
     any |= csePass(fn);
     any |= copyCoalescePass(fn);
