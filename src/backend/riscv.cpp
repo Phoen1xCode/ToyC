@@ -230,6 +230,15 @@ class FunctionEmitter {
 
   bool isRegAllocated(int slot) const { return regMap_.find(slot) != regMap_.end(); }
 
+  // 把 slot 当前在 cache 中的 reg 名称返回；若不在 cache 但是 regAllocated
+  // 则返回 s-reg；否则返回空字符串。仅在严格的"立即可用"路径上调用。
+  std::string slotInReg(int slot) const {
+    auto m = regMap_.find(slot);
+    if (m != regMap_.end()) return m->second;
+    for (const auto &c : cache_) if (c.slot == slot) return c.reg;
+    return {};
+  }
+
   // 把"只被定义为 Op::Const 一次且永不被其他指令重写"的 slot 编入常量表。
   // 后端在 emitBinary 中据此把 mul/div/rem 常量优化为 shift/and/addi 等等，
   // 也可以把常量短直接 li 到工作寄存器，省略 sw/lw 的中间往返。
@@ -503,21 +512,31 @@ class FunctionEmitter {
 
     // -------- 强度削减 / addi 折叠：rhs 是已知常量 ----------
     if (rConst) {
+      const std::string lhsReg = slotInReg(inst.lhs);
+      auto loadLhs = [&](const char *target) {
+        if (!lhsReg.empty()) {
+          if (lhsReg == target) return std::string(target);
+          out_ << "  mv " << target << ", " << lhsReg << "\n";
+          return std::string(target);
+        }
+        loadSlot(target, inst.lhs);
+        return std::string(target);
+      };
       switch (inst.binary) {
         case ir::BinaryOp::Add:
           if (kr >= -2048 && kr <= 2047) {
-            loadSlot("t0", inst.lhs);
+            const std::string src = lhsReg.empty() ? (loadSlot("t0", inst.lhs), std::string("t0")) : lhsReg;
             killReg("a0");
-            out_ << "  addi a0, t0, " << kr << "\n";
+            out_ << "  addi a0, " << src << ", " << kr << "\n";
             storeSlot("a0", inst.dest);
             return;
           }
           break;
         case ir::BinaryOp::Sub:
           if (-kr >= -2048 && -kr <= 2047) {
-            loadSlot("t0", inst.lhs);
+            const std::string src = lhsReg.empty() ? (loadSlot("t0", inst.lhs), std::string("t0")) : lhsReg;
             killReg("a0");
-            out_ << "  addi a0, t0, " << (-kr) << "\n";
+            out_ << "  addi a0, " << src << ", " << (-kr) << "\n";
             storeSlot("a0", inst.dest);
             return;
           }
@@ -536,16 +555,16 @@ class FunctionEmitter {
             return;
           }
           if (kr == -1) {
-            loadSlot("t0", inst.lhs);
+            const std::string src = lhsReg.empty() ? (loadSlot("t0", inst.lhs), std::string("t0")) : lhsReg;
             killReg("a0");
-            out_ << "  neg a0, t0\n";
+            out_ << "  neg a0, " << src << "\n";
             storeSlot("a0", inst.dest);
             return;
           }
           if (kr > 0 && (kr & (kr - 1)) == 0) {
-            loadSlot("t0", inst.lhs);
+            const std::string src = lhsReg.empty() ? (loadSlot("t0", inst.lhs), std::string("t0")) : lhsReg;
             killReg("a0");
-            out_ << "  slli a0, t0, " << log2pow2(kr) << "\n";
+            out_ << "  slli a0, " << src << ", " << log2pow2(kr) << "\n";
             storeSlot("a0", inst.dest);
             return;
           }
@@ -558,23 +577,22 @@ class FunctionEmitter {
             return;
           }
           if (kr == -1) {
-            loadSlot("t0", inst.lhs);
+            const std::string src = lhsReg.empty() ? (loadSlot("t0", inst.lhs), std::string("t0")) : lhsReg;
             killReg("a0");
-            out_ << "  neg a0, t0\n";
+            out_ << "  neg a0, " << src << "\n";
             storeSlot("a0", inst.dest);
             return;
           }
           if (kr > 1 && (kr & (kr - 1)) == 0) {
-            // Signed division by 2^k with round-towards-zero (C semantics):
-            //   t1 = x >> 31           (all 1s if x<0, else 0)
-            //   t1 = t1 >>u (32-k)      (k 1s in low bits if x<0 — bias)
-            //   t0 = (x + t1) >>s k
+            // 把 src 放到 t0（必须留住源），结果计算在 a0。
+            const std::string src = lhsReg.empty() || lhsReg == "a0"
+                ? (loadSlot("t0", inst.lhs), std::string("t0"))
+                : lhsReg;
             const int k = log2pow2(kr);
-            loadSlot("t0", inst.lhs);
             killReg("a0");
-            out_ << "  srai a0, t0, 31\n"
+            out_ << "  srai a0, " << src << ", 31\n"
                  << "  srli a0, a0, " << (32 - k) << "\n"
-                 << "  add a0, t0, a0\n"
+                 << "  add a0, " << src << ", a0\n"
                  << "  srai a0, a0, " << k << "\n";
             storeSlot("a0", inst.dest);
             return;
@@ -588,19 +606,17 @@ class FunctionEmitter {
             return;
           }
           if (kr > 1 && (kr & (kr - 1)) == 0) {
-            // Signed rem by 2^k. Compute (x mod 2^k) preserving sign of x:
-            //   t1 = x >> 31; t1 = t1 >>u (32-k);    bias = (x<0 ? 2^k-1 : 0)
-            //   q = (x + bias) >>s k
-            //   r = x - q*2^k = x - (q << k)
+            const std::string src = lhsReg.empty() || lhsReg == "a0"
+                ? (loadSlot("t0", inst.lhs), std::string("t0"))
+                : lhsReg;
             const int k = log2pow2(kr);
-            loadSlot("t0", inst.lhs);
             killReg("a0");
-            out_ << "  srai a0, t0, 31\n"
+            out_ << "  srai a0, " << src << ", 31\n"
                  << "  srli a0, a0, " << (32 - k) << "\n"
-                 << "  add a0, t0, a0\n"
+                 << "  add a0, " << src << ", a0\n"
                  << "  srai a0, a0, " << k << "\n"
                  << "  slli a0, a0, " << k << "\n"
-                 << "  sub a0, t0, a0\n";
+                 << "  sub a0, " << src << ", a0\n";
             storeSlot("a0", inst.dest);
             return;
           }
@@ -608,6 +624,7 @@ class FunctionEmitter {
         default:
           break;
       }
+      (void)loadLhs;
     }
     // -------- 强度削减：lhs 是已知常量（仅交换可行的 op）---------
     if (lConst) {
