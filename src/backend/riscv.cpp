@@ -150,7 +150,11 @@ class FunctionEmitter {
   // reg -> slot 单向不重复；slot -> reg 也唯一。
   struct CacheRow { int slot; std::string reg; };
   std::vector<CacheRow> cache_;
-  static constexpr int kCacheCap = 8;
+  // 反方向跟踪：t0 / a0 / 等"工作寄存器"上次被 mv 自哪个 s-reg。下次
+  // loadSlot 同一 regAllocated slot 时若 reg 仍持有相同 s-reg 值（即中间
+  // 没有写过这个 reg），跳过 mv。invalidateCache 同步清空。
+  std::unordered_map<std::string, std::string> sRegHeld_;
+  static constexpr int kCacheCap = 16;
 
   void dropReg(const std::string &reg) {
     cache_.erase(std::remove_if(cache_.begin(), cache_.end(),
@@ -176,10 +180,10 @@ class FunctionEmitter {
     cache_.push_back({slot, reg});
     while (static_cast<int>(cache_.size()) > kCacheCap) cache_.erase(cache_.begin());
   }
-  void invalidateCache() { cache_.clear(); }
+  void invalidateCache() { cache_.clear(); sRegHeld_.clear(); }
 
   // 写入工作寄存器时通知 cache：该 reg 上所有旧 slot 映射失效。
-  void killReg(const std::string &reg) { dropReg(reg); }
+  void killReg(const std::string &reg) { dropReg(reg); sRegHeld_.erase(reg); }
 
   // 选出使用频率最高的若干用户命名社位（VarDecl，不含参数）映射到 s2..s11。
   // 这些通常是循环中贯穿的归纳变量/累加器，入 s-reg 后避免每次 lw/sw。
@@ -269,13 +273,15 @@ class FunctionEmitter {
     for (const auto &kv : defs)
       if (kv.second == 1) slotConst_[kv.first] = values[kv.first];
 
-    // singleUseTemps_: 1 read, 1 def (any kind), 非命名、非参数
-    std::unordered_set<int> namedSet(func_.namedSlots.begin(), func_.namedSlots.end());
+    // 单读 + 单定义、非参数；用户命名的局部变量也算（短生命期临时常常
+    // 被用户用 int x = ...; ... x 单次消费的形式写出来）。寄存器分配的
+    // 槽位由其它通路处理，这里允许通过——storeSlot 看到 regMap_ 命中
+    // 会先一步发出 mv 不走 sw 路径。
     std::unordered_set<int> paramSet(func_.paramSlots.begin(), func_.paramSlots.end());
     std::unordered_set<int> oneReadOneDefTemps;
     for (const auto &kv : defs) {
       const int slot = kv.first;
-      if (namedSet.count(slot) || paramSet.count(slot)) continue;
+      if (paramSet.count(slot)) continue;
       auto rit = reads.find(slot);
       if (rit == reads.end() || rit->second != 1) continue;
       oneReadOneDefTemps.insert(slot);
@@ -340,14 +346,19 @@ class FunctionEmitter {
   }
 
   void loadSlot(const char *reg, int slot) {
-    // 被寄存器分配的 slot 其家在 s-reg；不走 cache，也不可被缓存命中
-    // （cache 中临时 reg 早已被覆盖）。
     auto m = regMap_.find(slot);
     if (m != regMap_.end()) {
+      // 跟踪 t0 / a0 上一次 mv 进来的 s-reg 值，避免每次都重复 mv。
+      auto it = sRegHeld_.find(reg);
+      if (it != sRegHeld_.end() && it->second == m->second) return;
       out_ << "  mv " << reg << ", " << m->second << "\n";
+      sRegHeld_[reg] = m->second;
+      // 普通 cache 中以 reg 为 key 的临时 slot 被覆盖
+      dropReg(reg);
       return;
     }
-    // 常量 slot：直接 li，不去内存找。这要求 Const 指令本身可以省略 sw。
+    // 一旦从其他来源写 reg，sRegHeld_ 该 reg 标记失效
+    sRegHeld_.erase(reg);
     int cv = 0;
     if (isConstSlot(slot, cv)) {
       std::string regs(reg);
