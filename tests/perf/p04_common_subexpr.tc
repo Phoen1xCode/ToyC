@@ -1,0 +1,19 @@
+// p04_common_subexpr: 多个相同的子表达式应只算一次
+int g(int a, int b) { return a * b; }
+int main() {
+  int x = 7;
+  int y = 13;
+  int s = 0;
+  int i = 0;
+  while (i < 500) {
+    int e1 = (x * y) + (x * y) + (x * y);
+    int e2 = (x + y) * (x + y);
+    int e3 = (y - x) * (y - x) + (x - y) * (x - y);
+    // also nested: g(x,y) called multiple times with same args
+    int c1 = g(x, y);
+    int c2 = g(x, y);
+    s = s + e1 + e2 + e3 + c1 + c2;
+    i = i + 1;
+  }
+  return s % 256;
+}

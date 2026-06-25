@@ -1,0 +1,18 @@
+// p03_copy: 复写传播应消除中间拷贝
+int main() {
+  int x = 3;
+  int y = x;
+  int z = y;
+  int w = z;
+  int v = w;
+  int s = 0;
+  int i = 0;
+  while (i < 200) {
+    int a = i;
+    int b = a;
+    int c = b;
+    s = s + c;
+    i = i + 1;
+  }
+  return (s + v) % 256;
+}

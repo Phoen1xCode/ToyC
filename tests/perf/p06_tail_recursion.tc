@@ -1,0 +1,14 @@
+// p06_tail_recursion: 尾递归求和，鼓励优化为循环
+int sum(int n, int acc) {
+  if (n == 0) return acc;
+  return sum(n - 1, acc + n);
+}
+int fact(int n, int acc) {
+  if (n == 0) return acc;
+  return fact(n - 1, acc * n);
+}
+int main() {
+  int a = sum(5000, 0);
+  int b = fact(10, 1);
+  return (a + b) % 256;
+}

@@ -1,0 +1,21 @@
+// p11_global_const_prop: 全局常量穿透使用点
+const int A = 3;
+const int B = 4;
+const int C = 5;
+const int D = 6;
+const int E = 7;
+int foo(int x) {
+  return x + A * B;
+}
+int bar(int x) {
+  return x - C * D + E;
+}
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 5000) {
+    s = s + foo(i) + bar(i);
+    i = i + 1;
+  }
+  return s % 256;
+}

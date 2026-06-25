@@ -4,6 +4,7 @@
 #include <ostream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "support/diagnostic.hpp"
@@ -24,51 +25,170 @@ class FunctionEmitter {
 
   void emit() {
     frameSize_ = frameSize(func_);
+    collectBranchTargets();
     out_ << "  .text\n"
          << "  .globl " << func_.name << "\n"
-         << func_.name << ":\n"
-         << "  addi sp, sp, -" << frameSize_ << "\n"
-         << "  sw ra, " << frameSize_ - 4 << "(sp)\n"
-         << "  sw s0, " << frameSize_ - 8 << "(sp)\n"
-         << "  addi s0, sp, " << frameSize_ << "\n";
+         << func_.name << ":\n";
+    emitAddSp(-frameSize_);
+    emitSwReg("ra", frameSize_ - 4, "sp");
+    emitSwReg("s0", frameSize_ - 8, "sp");
+    emitAddiReg("s0", "sp", frameSize_);
 
     for (std::size_t i = 0; i < func_.paramSlots.size(); ++i) {
       const int offset = slotOffset(func_.paramSlots[i]);
       if (i < 8) {
-        out_ << "  sw a" << i << ", " << offset << "(s0)\n";
+        emitSwReg("a" + std::to_string(i), offset, "s0");
       } else {
-        out_ << "  lw t0, " << (static_cast<int>(i) - 8) * 4 << "(s0)\n"
-             << "  sw t0, " << offset << "(s0)\n";
+        // 参数 8+ 由调用方放在调用者栈上（位于 sp 之前）；
+        // 我们约定调用方按溢出顺序写入以 s0 为基址的正偏移，
+        // 即 (i-8)*4。为 i*4 偏移过大时同样需要大偏移 helper。
+        emitLwReg("t0", (static_cast<int>(i) - 8) * 4, "s0");
+        emitSwReg("t0", offset, "s0");
       }
     }
 
     for (const auto &inst : func_.instructions) emitInst(inst);
-    out_ << returnLabel() << ":\n"
-         << "  lw ra, -4(s0)\n"
-         << "  lw s0, -8(s0)\n"
-         << "  addi sp, sp, " << frameSize_ << "\n"
-         << "  ret\n";
+    out_ << returnLabel() << ":\n";
+    emitLwReg("ra", -4, "s0");
+    emitLwReg("s0", -8, "s0");
+    emitAddSp(frameSize_);
+    out_ << "  ret\n";
   }
 
  private:
   std::string returnLabel() const { return ".L_" + func_.name + "_return"; }
 
-  void loadSlot(const char *reg, int slot) { out_ << "  lw " << reg << ", " << slotOffset(slot) << "(s0)\n"; }
+  // 逆扫描一遇反过来：报Branch/Goto 的标号标为“汇合点”，需要在 Label 处
+  // 清空 cache；未被任何分支跳转的 Label（单附从 fallback）可以沿用 cache，
+  // 对于循环的 body_label 恰好保留循环体进入载荷后的负载区间。
+  std::unordered_set<std::string> branchTargets_;
+  void collectBranchTargets() {
+    for (const auto &inst : func_.instructions) {
+      if (inst.op == ir::Instruction::Op::Goto) branchTargets_.insert(inst.label);
+      else if (inst.op == ir::Instruction::Op::Branch) {
+        if (!inst.label.empty()) branchTargets_.insert(inst.label);
+        if (!inst.falseLabel.empty()) branchTargets_.insert(inst.falseLabel);
+      }
+    }
+    branchTargets_.insert(returnLabel());
+  }
 
-  void storeSlot(const char *reg, int slot) { out_ << "  sw " << reg << ", " << slotOffset(slot) << "(s0)\n"; }
+  // --- big-immediate helpers ------------------------------------------------
+  // emit "addi rd, rs, imm" splitting if |imm| > 2047
+  void emitAddiReg(const std::string &rd, const std::string &rs, int imm) {
+    if (imm >= -2048 && imm <= 2047) {
+      out_ << "  addi " << rd << ", " << rs << ", " << imm << "\n";
+      return;
+    }
+    out_ << "  li t6, " << imm << "\n"
+         << "  add " << rd << ", " << rs << ", t6\n";
+  }
+
+  // emit "addi sp, sp, imm" splitting if needed
+  void emitAddSp(int imm) { emitAddiReg("sp", "sp", imm); }
+
+  // emit "sw reg, offset(base)" splitting large offsets through t6
+  void emitSwReg(const std::string &reg, int offset, const std::string &base) {
+    if (offset >= -2048 && offset <= 2047) {
+      out_ << "  sw " << reg << ", " << offset << "(" << base << ")\n";
+      return;
+    }
+    out_ << "  li t6, " << offset << "\n"
+         << "  add t6, " << base << ", t6\n"
+         << "  sw " << reg << ", 0(t6)\n";
+  }
+
+  // emit "lw reg, offset(base)" splitting large offsets through t6
+  void emitLwReg(const std::string &reg, int offset, const std::string &base) {
+    if (offset >= -2048 && offset <= 2047) {
+      out_ << "  lw " << reg << ", " << offset << "(" << base << ")\n";
+      return;
+    }
+    out_ << "  li t6, " << offset << "\n"
+         << "  add t6, " << base << ", t6\n"
+         << "  lw " << reg << ", 0(t6)\n";
+  }
+
+  // 多槽 LRU 寄存器缓存窥孔：同时保存最近写入最多 8 个 slot 的“在本寄存
+  // 器里有一份最新值”的事实。load 命中时直接 mv，避免冗余 lw；store 后
+  // 在 reg 上登记 slot。任何跨越控制流都会全部失效。
+  // reg -> slot 单向不重复；slot -> reg 也唯一。
+  struct CacheRow { int slot; std::string reg; };
+  std::vector<CacheRow> cache_;
+  static constexpr int kCacheCap = 8;
+
+  void dropReg(const std::string &reg) {
+    cache_.erase(std::remove_if(cache_.begin(), cache_.end(),
+        [&](const CacheRow &c) { return c.reg == reg; }), cache_.end());
+  }
+  void dropSlot(int slot) {
+    cache_.erase(std::remove_if(cache_.begin(), cache_.end(),
+        [&](const CacheRow &c) { return c.slot == slot; }), cache_.end());
+  }
+  const CacheRow *findCached(int slot) const {
+    for (const auto &c : cache_) if (c.slot == slot) return &c;
+    return nullptr;
+  }
+  void promote(int slot) {
+    auto it = std::find_if(cache_.begin(), cache_.end(),
+        [&](const CacheRow &c) { return c.slot == slot; });
+    if (it != cache_.end() && it + 1 != cache_.end()) {
+      CacheRow row = *it; cache_.erase(it); cache_.push_back(row);
+    }
+  }
+  void addCache(int slot, const std::string &reg) {
+    dropSlot(slot); dropReg(reg);
+    cache_.push_back({slot, reg});
+    while (static_cast<int>(cache_.size()) > kCacheCap) cache_.erase(cache_.begin());
+  }
+  void invalidateCache() { cache_.clear(); }
+
+  void loadSlot(const char *reg, int slot) {
+    if (const CacheRow *c = findCached(slot)) {
+      if (reg != c->reg) {
+        out_ << "  mv " << reg << ", " << c->reg << "\n";
+        std::string regs(reg);
+        dropReg(regs);
+        addCache(slot, regs);
+      } else {
+        promote(slot);
+      }
+      return;
+    }
+    std::string regs(reg);
+    dropReg(regs);
+    emitLwReg(reg, slotOffset(slot), "s0");
+  }
+
+  void storeSlot(const char *reg, int slot) {
+    emitSwReg(reg, slotOffset(slot), "s0");
+    std::string regs(reg);
+    // sw 不修改源 reg；reg 上原本缓存的别的 slot 仍与内存一致（但内存
+    // 中该 slot 仍是旧值，不需要修改）。但是我们登记新 cache (slot, reg)，
+    // 而 reg 此前若已在别条 cache 中（reg 仍是別的 slot 的有效缓存）则
+    // 该 slot 的实际内存值仍是旧值，与 reg 内容不同；敝 斧 避 产生 例 错。
+    // 为安全起见，先以 dropReg 清除任何 “reg 是另外一套 slot 的缓存” 的
+    // 陈腐语义。
+    addCache(slot, regs);
+  }
 
   void emitInst(const ir::Instruction &inst) {
     switch (inst.op) {
       case ir::Instruction::Op::Label:
+        if (branchTargets_.find(inst.label) != branchTargets_.end())
+          invalidateCache();
         out_ << inst.label << ":\n";
         return;
       case ir::Instruction::Op::Goto:
+        invalidateCache();
         out_ << "  j " << inst.label << "\n";
         return;
       case ir::Instruction::Op::Branch:
         loadSlot("a0", inst.lhs);
         if (!inst.label.empty()) out_ << "  bnez a0, " << inst.label << "\n";
         if (!inst.falseLabel.empty()) out_ << "  beqz a0, " << inst.falseLabel << "\n";
+        // Branch 有跳转 falseLabel/Label 的可能，都会被 Label 重复 invalidate。
+        // 这里不清 cache，从而 fall-through 的下一亲 Label 沿用 cache。
         return;
       case ir::Instruction::Op::Const:
         out_ << "  li a0, " << inst.value << "\n";
@@ -100,8 +220,10 @@ class FunctionEmitter {
       case ir::Instruction::Op::Return:
         loadSlot("a0", inst.lhs);
         out_ << "  j " << returnLabel() << "\n";
+        invalidateCache();
         return;
       case ir::Instruction::Op::ReturnVoid:
+        invalidateCache();
         out_ << "  li a0, 0\n"
              << "  j " << returnLabel() << "\n";
         return;
@@ -175,22 +297,27 @@ class FunctionEmitter {
 
     const std::size_t registerCount = std::min<std::size_t>(count, 8);
     const std::size_t overflowCount = count > 8 ? count - 8 : 0;
-    if (overflowCount > 0) out_ << "  addi sp, sp, -" << overflowCount * 4 << "\n";
+    if (overflowCount > 0) {
+      const int bytes = static_cast<int>(overflowCount) * 4;
+      emitAddSp(-bytes);
+    }
 
+    // 寄存器参数从接近栈顶的位置取回。偏移可能很大，使用大偏移 helper。
     for (std::size_t i = 0; i < registerCount; ++i) {
-      const std::size_t offset = overflowCount * 4 + 4 * (count - 1 - i);
-      out_ << "  lw a" << i << ", " << offset << "(sp)\n";
+      const int offset = static_cast<int>(overflowCount) * 4 + 4 * (static_cast<int>(count) - 1 - static_cast<int>(i));
+      emitLwReg("a" + std::to_string(i), offset, "sp");
     }
     for (std::size_t i = 0; i < overflowCount; ++i) {
       const std::size_t argIndex = 8 + i;
-      const std::size_t from = overflowCount * 4 + 4 * (count - 1 - argIndex);
-      out_ << "  lw t0, " << from << "(sp)\n"
-           << "  sw t0, " << i * 4 << "(sp)\n";
+      const int from = static_cast<int>(overflowCount) * 4 + 4 * (static_cast<int>(count) - 1 - static_cast<int>(argIndex));
+      emitLwReg("t0", from, "sp");
+      emitSwReg("t0", static_cast<int>(i) * 4, "sp");
     }
 
     out_ << "  jal " << inst.name << "\n";
-    const std::size_t bytesToPop = (count + overflowCount) * 4;
-    if (bytesToPop > 0) out_ << "  addi sp, sp, " << bytesToPop << "\n";
+    const int bytesToPop = static_cast<int>((count + overflowCount) * 4);
+    if (bytesToPop > 0) emitAddSp(bytesToPop);
+    invalidateCache();
     storeSlot("a0", inst.dest);
   }
 

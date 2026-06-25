@@ -26,6 +26,26 @@ The test, command, or generated assembly behavior that proved the fix.
 
 No issues recorded yet.
 
+## 2026-06-25 - 评测机 p04 汇编错误：栈帧超出 12 位立即数范围
+
+**Stage**: RISC-V Backend / Testing
+
+**Problem**:
+评测平台反馈 p04_common_subexpr 报「汇编错误」0 分。本地用 `riscv64-elf-as` 复现：当函数局部槽位或入参超过约 508 个 4 字节时（frameSize > 2047），后端生成的所有 `addi sp, sp, -frameSize`、`sw ra, frameSize-4(sp)`、`addi s0, sp, frameSize` 以及栈槽 `sw/lw reg, offset(s0)` 都因 I-type 立即数范围 [-2048, 2047] 越界而成为 `illegal operands`。`emitCall` 里溢出参数的偏移 `(count-1-i)*4` 同样会越界。
+
+**Cause**:
+后端代码把所有立即数直接写进 `addi` 与 `sw/lw` 的 imm 区，没有为大栈帧/大参数列表做立即数拆分。RISC-V I-type imm 只有 12 位有符号。
+
+**Resolution**:
+在 `src/backend/riscv.cpp` 中引入立即数拆分 helper，并把 t6 作为专用地址临时寄存器（当前后端未使用 t6）：
+
+- `emitAddiReg(rd, rs, imm)`：imm 在范围内走 `addi`；否则 `li t6, imm; add rd, rs, t6`。`emitAddSp` 是它的特化。
+- `emitSwReg(reg, offset, base)` / `emitLwReg(reg, offset, base)`：offset 在范围内直接写；否则 `li t6, offset; add t6, base, t6; sw/lw reg, 0(t6)`。
+- 把 prologue/epilogue、形参保存、`loadSlot`/`storeSlot`、`emitCall` 中所有栈/store/load 全部改走 helper。
+
+**Verification**:
+`cmake --build build` 通过；600 个局部变量与 700 个入参的 stress 用例 `riscv64-elf-as -march=rv32im -mabi=ilp32` 全部汇编通过；`tools/run_perf.py` 12 个性能样例退出码仍全部等价于 gcc -O2 参考实现。
+
 ## 2026-06-25 - 远程评测机链接 `yy_scan_bytes` 未定义
 
 **Stage**: Build / RISC-V Backend

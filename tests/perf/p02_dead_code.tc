@@ -1,0 +1,21 @@
+// p02_dead_code: 大量死代码应被删除
+int waste(int x) {
+  int a = x * 7;
+  int b = a + 3;
+  int c = b - a;
+  int d = c * c;
+  int e = d - c;
+  return e;  // never used
+}
+int main() {
+  int i = 0;
+  int s = 0;
+  while (i < 100) {
+    int j = i * i;       // dead
+    int k = j + 3;       // dead
+    waste(i);            // dead call
+    s = s + i;
+    i = i + 1;
+  }
+  return s % 256;
+}

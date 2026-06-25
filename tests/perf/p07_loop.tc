@@ -1,0 +1,13 @@
+// p07_loop: 密集循环 + 循环不变量外提
+int main() {
+  const int base = 1234;
+  int s = 0;
+  int i = 0;
+  while (i < 10000) {
+    int inv = base * 3 + base;   // loop invariant
+    int body = i + inv;
+    s = s + body;
+    i = i + 1;
+  }
+  return s % 256;
+}

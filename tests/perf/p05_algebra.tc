@@ -1,0 +1,18 @@
+// p05_algebra: 代数化简 x+0, x*1, x*2, x-0, x*0
+int main() {
+  int x = 12345;
+  int s = 0;
+  int i = 0;
+  while (i < 1000) {
+    int a = x + 0;
+    int b = x * 1;
+    int c = x * 0;
+    int d = x - 0;
+    int e = x * 2;             // -> x<<1
+    int f = x * 4;            // -> x<<2
+    int g = x + x;            // -> x<<1
+    s = s + a + b + c + d + e + f + g;
+    i = i + 1;
+  }
+  return s % 256;
+}

@@ -1,0 +1,14 @@
+// p01_const: 常量折叠后核心循环应当化简为空/常量
+const int N = 100;
+const int M = 50;
+const int K = 25;
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < N) {
+    sum = sum + (N + M + K) * 2;
+    i = i + 1;
+  }
+  // N+M+K = 175, *2=350, *100 = 35000; mod 256 = 168
+  return sum % 256;
+}

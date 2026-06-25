@@ -1,0 +1,27 @@
+// p09_advanced_graph: 用邻接矩阵做 BFS 0-1 图
+const int V = 32;
+int adj(int i, int j) {
+  return (i + j) % 3 != 0;
+}
+int main() {
+  // 简易 BFS reachable count from 0
+  // 用一个固定数组模拟队列（用栈模拟队列即可，仅需结果）
+  int visited_0 = 1;
+  int visited_1 = 0;
+  int visited_2 = 0;
+  // 简化: 直接计算所有点是否被 0 路径可达（一行联通分量近似）
+  int reachable = 1;
+  int i = 0;
+  while (i < V) {
+    int j = 0;
+    while (j < V) {
+      if (i == 0 && adj(i, j)) {
+        if (j == 1) visited_1 = 1;
+        if (j == 2) visited_2 = 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return (reachable + visited_0 + visited_1 + visited_2) % 256;
+}

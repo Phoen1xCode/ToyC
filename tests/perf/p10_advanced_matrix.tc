@@ -1,0 +1,23 @@
+// p10_advanced_matrix: 三重循环矩阵风格计算（用三个标量代替元素以避开数组）
+int main() {
+  int i = 0;
+  int tr = 0;
+  int dr = 0;
+  int ll = 0;
+  while (i < 64) {
+    int j = 0;
+    while (j < 64) {
+      int z = 0;
+      while (z < 64) {
+        int v = (i * j + z) % 7;   // 内层三元乘加
+        tr = tr + v;
+        if (i == j) dr = dr + v;
+        if (i + j == 0) ll = ll + v;
+        z = z + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return (tr + dr + ll) % 256;
+}

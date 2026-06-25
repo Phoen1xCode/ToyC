@@ -1,0 +1,24 @@
+// p08_basic_combined: 综合基础优化（循环+常量传播+死代码+CSE+代数）
+int compute(int a, int b, int c) {
+  int t1 = a * b;
+  int t2 = a * b;
+  int t3 = t1 + t2;
+  int t4 = c + 0;
+  int t5 = t4 * 1;
+  int t6 = t3 + t5;
+  return t6;
+}
+int main() {
+  const int A = 5;
+  const int B = 7;
+  const int C = 11;
+  int i = 0;
+  int acc = 0;
+  while (i < 5000) {
+    int r1 = compute(A, B, C);
+    int r2 = compute(A, B, C);
+    acc = acc + r1 + r2;
+    i = i + 1;
+  }
+  return acc % 256;
+}
