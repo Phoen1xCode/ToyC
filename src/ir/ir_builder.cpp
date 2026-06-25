@@ -56,6 +56,7 @@ UnaryOp mapUnary(UnaryExpr::Op op) {
     case UnaryExpr::Op::Not:
       return UnaryOp::Not;
   }
+  __builtin_unreachable();
 }
 
 BinaryOp mapBinary(BinaryExpr::Op op) {

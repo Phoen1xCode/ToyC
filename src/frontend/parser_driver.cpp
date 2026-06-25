@@ -1,5 +1,6 @@
 #include "frontend/parser_driver.hpp"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
