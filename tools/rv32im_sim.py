@@ -135,6 +135,12 @@ class Sim:
             operands = [o.strip() for o in ops.split(',')] if ops else []
             text.append((mn, operands))
         self.text = text
+        # Initialize mem with .data section bytes so that la+lw reads the
+        # initial values of globals (without this, only sw-written globals
+        # are observable; pure-read globals like `int g = 41; return g;`
+        # would incorrectly load 0).
+        for i, b in enumerate(self.data_bytes):
+            self.mem[(self.data_base_addr + i) & 0xffffffff] = b
 
     def resolve_label(self, tok):
         tok = tok.strip()
