@@ -44,10 +44,6 @@ std::vector<int> readsOf(const ir::Instruction &i) {
   return out;
 }
 
-int frameSize(const ir::Function &func) {
-  const int localBytes = 8 + func.slotCount * 4;
-  return std::max(16, ((localBytes + 15) / 16) * 16);
-}
 
 class FunctionEmitter {
  public:
@@ -172,11 +168,14 @@ class FunctionEmitter {
     }
   }
   void addCache(int slot, const std::string &reg) {
-    dropSlot(slot); dropReg(reg);
+    dropSlot(slot);
     cache_.push_back({slot, reg});
     while (static_cast<int>(cache_.size()) > kCacheCap) cache_.erase(cache_.begin());
   }
   void invalidateCache() { cache_.clear(); }
+
+  // 写入工作寄存器时通知 cache：该 reg 上所有旧 slot 映射失效。
+  void killReg(const std::string &reg) { dropReg(reg); }
 
   // 选出使用频率最高的若干用户命名社位（VarDecl，不含参数）映射到 s2..s11。
   // 这些通常是循环中贯穿的归纳变量/累加器，入 s-reg 后避免每次 lw/sw。
@@ -252,7 +251,6 @@ class FunctionEmitter {
     auto m = regMap_.find(slot);
     if (m != regMap_.end()) {
       out_ << "  mv " << m->second << ", " << reg << "\n";
-      // 被分配的 slot 不进 cache；其家在 s-reg，永不再 lw。
       return;
     }
     emitSwReg(reg, slotOffset(slot), "s0");
@@ -278,6 +276,7 @@ class FunctionEmitter {
         // 这里不清 cache，从而 fall-through 的下一亲 Label 沿用 cache。
         return;
       case ir::Instruction::Op::Const:
+        killReg("a0");
         out_ << "  li a0, " << inst.value << "\n";
         storeSlot("a0", inst.dest);
         return;
@@ -286,11 +285,13 @@ class FunctionEmitter {
         storeSlot("a0", inst.dest);
         return;
       case ir::Instruction::Op::LoadGlobal:
+        killReg("t0"); killReg("a0");
         out_ << "  la t0, " << inst.name << "\n"
              << "  lw a0, 0(t0)\n";
         storeSlot("a0", inst.dest);
         return;
       case ir::Instruction::Op::StoreGlobal:
+        killReg("t0");
         loadSlot("a0", inst.lhs);
         out_ << "  la t0, " << inst.name << "\n"
              << "  sw a0, 0(t0)\n";
@@ -311,6 +312,7 @@ class FunctionEmitter {
         return;
       case ir::Instruction::Op::ReturnVoid:
         invalidateCache();
+        killReg("a0");
         out_ << "  li a0, 0\n"
              << "  j " << returnLabel() << "\n";
         return;
@@ -319,6 +321,7 @@ class FunctionEmitter {
 
   void emitUnary(const ir::Instruction &inst) {
     loadSlot("a0", inst.lhs);
+    killReg("a0");  // unary op overwrites a0
     switch (inst.unary) {
       case ir::UnaryOp::Plus:
         break;
@@ -335,6 +338,7 @@ class FunctionEmitter {
   void emitBinary(const ir::Instruction &inst) {
     loadSlot("t0", inst.lhs);
     loadSlot("a0", inst.rhs);
+    killReg("a0");  // binary op overwrites a0
     switch (inst.binary) {
       case ir::BinaryOp::Less:
         out_ << "  slt a0, t0, a0\n";
