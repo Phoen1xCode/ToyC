@@ -26,6 +26,35 @@ The test, command, or generated assembly behavior that proved the fix.
 
 No issues recorded yet.
 
+## 2026-06-26 - 性能优化阶段二：内联 + LICM + 调用约定 + 除法 magic（已落地）
+
+**Stage**: Optimization / IR / RISC-V Backend / Testing
+
+**Problem**:
+平台反馈性能仅 15/100：p01_const 2769ms（gcc-O2 的 10%）、p07_loop 15s（3%）、p08/p09/p10 超时、p12 104ms（63%）。本地 26 个 perf 用例虽全 PASS 但都是玩具级重构，掩盖了真实规模问题。从 `github/compiler2021` 的 `performance_test2021-private/` 看到平台真用例形态：hoist（10 万次循环 + 15 个不变参数累加 70 遍）、div-opt（1000 个参数各 / 常数）、inst-combining（input=input+1 重复 1 万次）、dce（10 万行未用局部变量）。
+
+**Cause**:
+读 `p08`/`p09`/`p10` 生成汇编定位 5 个根因：
+1. 调用约定全栈化 —— 被调方把每个 a-reg 参数 `sw` 落栈再 `lw` 回来；调用方对每个实参 `addi sp,-4; sw 0(sp)` push 再 `lw` pop 回 a-reg。3 参纯函数调用 ≈ 12 条 sw/lw 往返。
+2. 无函数内联 —— `compute(5,7,11)`、`adj(i,j)` 等纯函数循环调用没被消除。
+3. 常量实参调用不 specialize —— `compute(5,7,11)` 实参全常量却走完整 calling convention。
+4. LICM 缺失 —— 循环不变量每次迭代重算，IR 优化全是基本块内局部。
+5. 非 2 幂除法/取模未强度削减 —— `% 7`、`/ 300` 仍发 `rem`/`div`。
+
+**Resolution**:
+分 5 阶段实现，每阶段独立 commit：
+
+1. **阶段 0**：从 compiler2021/private 迁移 4 个 ToyC 用例（hoist/div-opt/inst-combining/dce 各 1）到 `tests/perf/p27-p30.tc`，规模缩减到本地可跑，由 gcc -O2 定标退出码。这给后续优化提供贴近平台的回归基准。
+2. **阶段 1**：`src/ir/optim.cpp` 新增 `inlinePass`：调用图 Tarjan SCC 找环、纯 leaf/loop-free/小体（≤400 IR）判定、实参替换内联、Return→Move+Goto。驱动器先对每个 fn 跑局部优化瘦身（让 DCE-heavy 的 `dce-1` 风格 callee 在内联前就崩塌成 `global=i0` 一条），再判定可内联性、内联、再清理，迭代到不动点。结果：p08 -87%、p25 -63%、p26 -56%、p28 -77%、p29 -66%、p30 -52%。
+3. **阶段 2**：`licmPass` 利用 IR builder 固定的 while 标签模式识别循环，按"纯定值 + 操作数循环外定义 + 自身在循环内单 def"判定不变量并外提到 cond label 前。`Call` 阻塞其后外提；`LoadGlobal` 仅在循环无 `StoreGlobal` 时可外提。结果：p23 -96%、p27 -95%、p28 -81%、p29 -87%、p10 -23%。
+4. **阶段 3**：`src/backend/riscv.cpp` 调用约定改造。`paramSlots` 与 `VarDecl` slot 一视同仁参与寄存器分配；prologue 用 `mv sX, aY`（前 8 参数）或 `lw sX, (i-8)*4(s0)`（溢出参数）把实参搬入 callee-saved s-reg。调用方 emitCall 直接 `loadSlot("aY", arg)`，反向顺序加载到 a0-a7，不再 push/pop 栈往返。修复了"溢出参数被分配到 s-reg 但 prologue 没初始化"的隐藏 bug（p23 退出码错）。结果：p13 fib -16%、p15 ackermann -18%、p06 尾递归 -21%、p19 gcd -21%、p21 tribonacci -16%。
+5. **阶段 4**：`emitDivByConst` 实现 Hacker's Delight Fig.10-1 的 magic multiplier 算法。对非 0/±1/±2^k 除数 `d` 算 `(M, s, addMarker)`，发射 `li M; mulh; [add/sub x]; [srai s]; srli sign; add` 序列；Mod 加 `mul; sub`。修复模拟器 `mulh` 用 unsigned 实现的 bug（应是 signed × signed → 高 32 位）。把硬件 20-40 周期的 `div`/`rem` 换成 ~5-10 周期的 mulh+移位序列。模拟步数轻微退化（每条指令算 1 步，多发指令看似变慢）但平台真机预期显著加速。
+
+**Verification**:
+全部 30 个 perf 用例（26 推测 + 4 迁移）退出码与 `gcc -O2` 完全一致；功能样例（10 参数、void+全局、短路、嵌套调用、递归）全部 PASS。整体收益（vs 本次优化前）：p08 -87%、p23 -95%、p25 -63%、p26 -56%、p27 -92%、p28 -95%、p29 -96%、p30 -52%、p13/p15 -16~18%。
+
+每阶段独立 commit（8167fc7/01845d3/8c11eb3/eb5b35d/4ee0290），便于回退定位。回退 bug 在阶段 3 通过"先小复现（单调用、循环调用、多 s-reg）逐步验证"的方法识别并修复。
+
 ## 2026-06-25 - 评测机 p04 汇编错误：栈帧超出 12 位立即数范围
 
 **Stage**: RISC-V Backend / Testing
