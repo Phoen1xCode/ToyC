@@ -66,8 +66,18 @@ class FunctionEmitter {
 
     for (std::size_t i = 0; i < func_.paramSlots.size(); ++i) {
       const int slot = func_.paramSlots[i];
-      // 参数一律落栈，不录入 s-reg。避免调用方在 emitCall 中复用 a-i 与被调
-      // 用方映射到同一 s-reg 的冲突路径。
+      // 参数若被分配到 s-reg，prologue 把实参搬进 s-reg（callee-saved，跨
+      // 函数内部调用安全）。前 8 个参数在 a-reg：`mv sX, aY`；溢出参数在调用
+      // 方栈上（相对 s0 偏移 (i-8)*4）：`lw sX, (i-8)*4(s0)`。否则落栈到栈槽。
+      auto rm = regMap_.find(slot);
+      if (rm != regMap_.end()) {
+        if (i < 8) {
+          out_ << "  mv " << rm->second << ", a" << i << "\n";
+        } else {
+          emitLwReg(rm->second, (static_cast<int>(i) - 8) * 4, "s0");
+        }
+        continue;
+      }
       const int offset = slotOffset(slot);
       if (i < 8) {
         emitSwReg("a" + std::to_string(i), offset, "s0");
@@ -185,9 +195,10 @@ class FunctionEmitter {
   // 写入工作寄存器时通知 cache：该 reg 上所有旧 slot 映射失效。
   void killReg(const std::string &reg) { dropReg(reg); sRegHeld_.erase(reg); }
 
-  // 选出使用频率最高的若干用户命名社位（VarDecl，不含参数）映射到 s2..s11。
-  // 这些通常是循环中贯穿的归纳变量/累加器，入 s-reg 后避免每次 lw/sw。
-  // 参数一律落栈不参与映射，避免调用约定复杂交互。
+  // 选出使用频率最高的若干用户命名社位（VarDecl + 形参）映射到 s2..s11。
+  // 这些通常是循环中贯穿的归纳变量/累加器/形参，入 s-reg 后避免每次 lw/sw。
+  // 形参与 VarDecl 一视同仁参与分配：被调方 prologue 用 `mv sX, aY` 把实参
+  // 从 a-reg 搬到分配的 s-reg（callee-saved，跨函数内部调用安全）。
   std::unordered_map<int, std::string> regMap_;
   std::vector<std::string> savedSRegs_;
   static constexpr int kMaxRegAlloc = 10;  // s2..s11
@@ -196,11 +207,9 @@ class FunctionEmitter {
     std::unordered_map<int, int> uses;
     for (const auto &inst : func_.instructions)
       for (int s : readsOf(inst)) ++uses[s];
-    // 只考虑 VarDecl 产生的 namedSlot；参数已设为落栈，这里排除 paramSlots。
-    std::unordered_set<int> paramSet(func_.paramSlots.begin(), func_.paramSlots.end());
+    // VarDecl 与形参都参与分配。
     std::vector<std::pair<int,int>> ranked;
     for (int s : func_.namedSlots) {
-      if (paramSet.count(s)) continue;
       int u = uses.count(s) ? uses[s] : 0;
       if (u > 0) ranked.emplace_back(u, s);
     }
@@ -317,7 +326,6 @@ class FunctionEmitter {
         const auto &mid = func_.instructions[j];
         if (mid.op == ir::Instruction::Op::Label) { ++j; continue; }
         if (mid.op == ir::Instruction::Op::Const) {
-          int cv = 0;
           if (mid.dest != -1 && slotConst_.count(mid.dest) &&
               slotConst_[mid.dest] == mid.value &&
               !regMap_.count(mid.dest)) {
@@ -354,7 +362,7 @@ class FunctionEmitter {
     return true;
   }
 
-  void loadSlot(const char *reg, int slot) {
+  void loadSlot(const std::string &reg, int slot) {
     auto m = regMap_.find(slot);
     if (m != regMap_.end()) {
       // 跟踪 t0 / a0 上一次 mv 进来的 s-reg 值，避免每次都重复 mv。
@@ -755,33 +763,32 @@ class FunctionEmitter {
 
   void emitCall(const ir::Instruction &inst) {
     const std::size_t count = inst.args.size();
-    for (int arg : inst.args) {
-      loadSlot("a0", arg);
-      pushA0();
-    }
-
     const std::size_t registerCount = std::min<std::size_t>(count, 8);
     const std::size_t overflowCount = count > 8 ? count - 8 : 0;
+
+    // Overflow args (index 8..) go on the caller stack at [0 .. overflowCount*4).
+    // Push them first (in reverse so the lowest-index overflow arg ends up at
+    // the lowest address, matching the standard ABI where arg8 is at 0(sp)).
     if (overflowCount > 0) {
-      const int bytes = static_cast<int>(overflowCount) * 4;
-      emitAddSp(-bytes);
+      emitAddSp(-static_cast<int>(overflowCount) * 4);
+      for (std::size_t i = 0; i < overflowCount; ++i) {
+        const std::size_t argIndex = 8 + i;
+        loadSlot("a0", inst.args[argIndex]);
+        emitSwReg("a0", static_cast<int>(i) * 4, "sp");
+      }
     }
 
-    // 寄存器参数从接近栈顶的位置取回。偏移可能很大，使用大偏移 helper。
-    for (std::size_t i = 0; i < registerCount; ++i) {
-      const int offset = static_cast<int>(overflowCount) * 4 + 4 * (static_cast<int>(count) - 1 - static_cast<int>(i));
-      emitLwReg("a" + std::to_string(i), offset, "sp");
-    }
-    for (std::size_t i = 0; i < overflowCount; ++i) {
-      const std::size_t argIndex = 8 + i;
-      const int from = static_cast<int>(overflowCount) * 4 + 4 * (static_cast<int>(count) - 1 - static_cast<int>(argIndex));
-      emitLwReg("t0", from, "sp");
-      emitSwReg("t0", static_cast<int>(i) * 4, "sp");
+    // Register args a0..a7. Load in reverse (a7 first, a0 last) so that if any
+    // loadSlot path temporarily reuses an a-reg as a scratch, the final a0
+    // write is not clobbered by a later load. loadSlot("aK", slot) only writes
+    // aK (it never touches other a-regs directly), so forward order would also
+    // work; reverse is a defensive belt-and-suspenders.
+    for (std::size_t k = registerCount; k-- > 0;) {
+      loadSlot("a" + std::to_string(k), inst.args[k]);
     }
 
     out_ << "  jal " << inst.name << "\n";
-    const int bytesToPop = static_cast<int>((count + overflowCount) * 4);
-    if (bytesToPop > 0) emitAddSp(bytesToPop);
+    if (overflowCount > 0) emitAddSp(static_cast<int>(overflowCount) * 4);
     invalidateCache();
     storeSlot("a0", inst.dest);
   }
