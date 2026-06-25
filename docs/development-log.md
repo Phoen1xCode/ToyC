@@ -115,3 +115,36 @@ Implemented Flex tokens and Bison grammar for ToyC, connected parser input throu
 
 **Verification**:
 `cmake --build build` completed successfully. Behavioral samples for literals, precedence, unary operators, locals, assignment, nested scope shadowing, `if`/`else`, `while`, `break`, `continue`, short-circuit `&&`/`||`, functions, recursion, `void` calls, globals/constants, and ten-argument calls all matched expected exit codes in the local RISC-V instruction simulator.
+
+## 2026-06-25 - 性能优化阶段：IR 优化与后端窥孔（已落地）
+
+**Stage**: Optimization / RISC-V Backend / IR
+
+**Problem**:
+平台反馈 p04 汇编错误（0 分）、p08 运行超时，且多数用例得分 0.24–1.91，主要瓶颈是后端对每条 IR 都做"算出 a0 → sw 栈槽 → 下条 lw 取回"的内存往返。
+
+**Resolution**:
+1. 后端立即数溢出修复（救回 p04）：见 `docs/perf.md`。
+2. 后端多槽 LRU 寄存器缓存窥孔：cursor 指向刚写入的 slot 时直接 `mv`，避免冗余 `lw`；只在被 `Branch`/`Goto` 命中的 `Label` 整体失效。
+3. 新增 `src/ir/optim.cpp`：基本块内常量折叠/传播、代数化简、复写传播、基本块 CSE、单定值-单使用复写合并、全函数死代码删除，迭代至不动点，由 `main` 对每个 build 启用。
+
+**Verification**:
+`tools/run_perf.py` 对 12 个样例退出码与 `gcc -O2` 完全一致；模拟步数相对未优化版本下降 12%–44%。
+
+## 2026-06-25 - 后端寄存器分配（investigation, 已回退）
+
+**Stage**: RISC-V Backend / Optimization
+
+**Problem**:
+尝试把 `Function::namedSlots`（参数 + `VarDecl`）按使用频率映射到 `s2..s11`，并在 prologue/epilogue 保存/恢复，目的是彻底消除循环承载变量在 cond label 处的 `lw`。引入后 `p08_basic_combined`、`p09_advanced_graph`、`p11_global_const_prop` 退化为模拟超时（无限循环），`p04_common_subexpr` 汇编可执行但退出码错（68 vs 140）。
+
+**Cause** (部分定位):
+- 单调用 (`int g(a,b){return a*b;} int main(){return g(3,4);}`) 仍正确，说明调用约定本体无误。
+- 递归用例 `p06_tail_recursion` 仍正确。
+- 失败集中在"调用方有多个活跃 s-reg 且被调用方也使用重叠 s-reg 的循环"场景。怀疑点是被调用方 prologue `sw sX, frameSize-12-i*4(sp)` 与 epilogue `lw sX, -12-i*4(s0)` 在 sp 与 s0 关系下对齐正确，但调用方在 `emitCall` 里反复 `addi sp,sp,-4/sw 0(sp)` 压参，可能改变了被调用方看到的对齐基址，或 cache 与 s-reg 持久值交互不当；定位未完成。
+
+**Resolution**:
+回退 `src/backend/riscv.cpp` 到上一个全绿提交（仅保留 cache + IR opt + 立即数修复）。IR 侧保留 `namedSlots` 元数据（无害），供下次再尝试。
+
+**Next**:
+重新引入寄存器分配时，先写一个最小复现：调用方多 s-reg + 在循环中调用一个同样映射连续 s-reg 的纯函数，再逐项排查 prologue/epilogue 与 `emitCall` 的 sp 一致性。
