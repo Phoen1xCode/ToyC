@@ -336,45 +336,68 @@ bool copyPropPass(ir::Function &fn) {
 bool csePass(ir::Function &fn) {
   bool any = false;
   for (auto itbeg = fn.instructions.begin(); itbeg != fn.instructions.end();) {
-    // value-numbering map: slot -> canonical key. For constants the key is
-    // encoded as a high-bit-tagged integer so it cannot collide with raw slot
-    // numbers; for non-constants it is just the slot id itself.
     std::unordered_map<int, int> known;  // slot -> constant value
-    std::unordered_map<uint64_t, int> seen;  // key -> dest slot
+    // seen: key -> {dest, opSlotA, opSlotB}. opSlotA/opSlotB are the raw slot
+    // ids used as operands (-1 if the operand was a known constant at encode
+    // time). When a slot is redefined we drop every seen entry that still
+    // references it, so a later identical (op, operand) pattern is not wrongly
+    // rewritten to a stale value.
+    struct SeenEntry { int dest; int opA; int opB; };
+    std::unordered_map<uint64_t, SeenEntry> seen;
+    auto invalidate = [&](int slot) {
+      if (slot == -1) return;
+      for (auto it = seen.begin(); it != seen.end();)
+        if (it->second.opA == slot || it->second.opB == slot) it = seen.erase(it);
+        else ++it;
+    };
     auto cur = itbeg;
     while (cur != fn.instructions.end() && !isControlBoundary(*cur)) {
       if (cur->op == Op::Label) break;
       auto &inst = *cur;
-      if (inst.op == Op::Const) {
+      // Const defines its dest as a known constant. If this slot was
+      // previously used as a raw operand in any seen entry, those entries are
+      // now stale (the slot's value changed from "unknown" to a constant).
+      if (inst.op == Op::Const && inst.dest != -1) {
+        invalidate(inst.dest);
         known[inst.dest] = inst.value;
       }
-      // Encode operand: if slot is known-const, use a tagged value-key
-      // (high bit set is impossible for a non-negative slot id).
-      auto enc = [&](int slot) -> int {
+      auto enc = [&](int slot, int &rawSlot) -> int {
+        rawSlot = -1;
         auto it = known.find(slot);
-        if (it == known.end()) return slot;  // raw slot id
-        // mask to 24-bit constant value with top tag bit set
+        if (it == known.end()) { rawSlot = slot; return slot; }
         return 0x40000000 | (it->second & 0x3FFFFF);
       };
       if (inst.op == Op::Binary) {
-        auto op = static_cast<int>(inst.binary);
-        int a = enc(inst.lhs);
-        int b = enc(inst.rhs);
-        bool commute = (inst.binary == ir::BinaryOp::Add) || (inst.binary == ir::BinaryOp::Mul);
-        if (commute && a > b) std::swap(a, b);
-        uint64_t key =
-            (uint64_t)(op & 0xFFFF) << 48 | (uint64_t)(a & 0xFFFFFFFF) << 16 | (b & 0xFFFF);
-        auto it = seen.find(key);
-        if (it != seen.end()) {
-          int prev = it->second;
-          inst.op = Op::Move;
-          inst.lhs = prev;
-          inst.rhs = -1;
-          inst.binary = ir::BinaryOp::Add;
-          any = true;
-        } else {
-          seen[key] = inst.dest;
+        // Self-update (dest == lhs or dest == rhs) cannot be CSE'd: the dest
+        // redefines an operand, so identical keys yield different values.
+        const bool selfUpdate = (inst.dest == inst.lhs) || (inst.dest == inst.rhs);
+        if (!selfUpdate) {
+          int ra, rb;
+          auto op = static_cast<int>(inst.binary);
+          int a = enc(inst.lhs, ra);
+          int b = enc(inst.rhs, rb);
+          bool commute = (inst.binary == ir::BinaryOp::Add) || (inst.binary == ir::BinaryOp::Mul);
+          if (commute && a > b) { std::swap(a, b); std::swap(ra, rb); }
+          uint64_t key =
+              (uint64_t)(op & 0xFFFF) << 48 | (uint64_t)(a & 0xFFFFFFFF) << 16 | (b & 0xFFFF);
+          auto it = seen.find(key);
+          if (it != seen.end()) {
+            int prev = it->second.dest;
+            inst.op = Op::Move;
+            inst.lhs = prev;
+            inst.rhs = -1;
+            inst.binary = ir::BinaryOp::Add;
+            any = true;
+          } else {
+            seen[key] = {inst.dest, ra, rb};
+          }
         }
+        // The Binary defines inst.dest — invalidate any seen entry that used
+        // the old value of inst.dest.
+        invalidate(inst.dest);
+      } else if (definesSlot(inst) && inst.dest != -1) {
+        // Move/Unary/LoadGlobal redefine inst.dest.
+        invalidate(inst.dest);
       }
       ++cur;
     }
@@ -568,6 +591,129 @@ bool licmPass(ir::Function &fn) {
   return any;
 }
 
+// ---------------------------------------------------------------------------
+// Instruction combining: collapse chained constant self-add/sub on the same
+// slot. After copyCoalesce, `input = input + 1; input = input + 1; ...` looks
+// like a run of `Binary input = input Add constSlot` where constSlot is a
+// single-def Const. We merge a run into one `Binary input = input Add (sum)`
+// by bumping the first Const's value and dropping the later Binarys.
+//
+// Soundness: a merge of `x = x + c1` (at b1) and `x = x + c2` (at b2) into
+// `x = x + (c1+c2)` requires that NOTHING between b1+1 and b2-1 reads or
+// writes x — otherwise the intermediate value of x would be observed and
+// folding the two adds would change it. The second Binary's own read of x
+// (its lhs) is the merge point and is allowed. The first Binary's rhs Const
+// slot must be single-use (only the first Binary reads it) so changing its
+// value is safe; the dropped second Binary's rhs Const becomes dead and is
+// removed by DCE.
+// ---------------------------------------------------------------------------
+// Instruction combining: collapse chained constant add/sub on a temp chain.
+//
+// After copyProp, a run of `input = input + 1; input = input + 1; ...` looks
+// like a temp chain in the IR:
+//     Const c1=1; Binary t1 = input + c1; Move input <- t1;
+//     Const c2=1; Binary t2 = t1 + c2;    Move input <- t2;
+//     Const c3=1; Binary t3 = t2 + c3;    Move input <- t3; ...
+// (copyProp has replaced the `input` operand of each Binary with the previous
+// temp, since `Move input <- t1` makes input alias t1.)
+//
+// We track a "chain tip" — the temp slot whose value is `base + accum` — and
+// when the next Binary reads the tip and adds a constant, we:
+//   - bump the FIRST Binary's rhs Const by the new constant (so tip now holds
+//     base + accum + c), and
+//   - rewrite that next Binary to `Move tnext <- tip` (tnext is now a copy of
+//     tip), and advance the tip to tnext.
+// After the pass, copyProp replaces reads of tnext with tip, DCE drops the
+// dead Moves and now-unused Consts, and copyCoalesce folds the final
+// `Move input <- tip` into the first Binary. The net result is a single
+// `Binary input = input + (sum of all constants)`.
+//
+// Soundness: the first Binary's rhs Const must be single-use (only that Binary
+// reads it) so bumping its value is safe — verified at chain start. Later
+// Binarys' rhs Consts are simply orphaned (their reader is rewritten to a
+// Move) and removed by DCE. The chain breaks at any control-flow boundary or
+// when the tip slot is redefined.
+bool instCombinePass(ir::Function &fn) {
+  bool any = false;
+  const auto uses = computeUseCount(fn);
+  // defCount[slot] = number of pure defs in the function; constDefIndex[slot]
+  // = index of the single Const def, valid only when defCount==1.
+  std::unordered_map<int, int> defCount;
+  std::unordered_map<int, std::size_t> constDefIndex;
+  for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
+    const auto &ins = fn.instructions[i];
+    if (definesSlot(ins) && ins.dest != -1) {
+      ++defCount[ins.dest];
+      if (ins.op == Op::Const) constDefIndex[ins.dest] = i;
+      else constDefIndex.erase(ins.dest);
+    }
+  }
+  for (auto it = constDefIndex.begin(); it != constDefIndex.end();)
+    if (defCount[it->first] != 1) it = constDefIndex.erase(it); else ++it;
+
+  std::unordered_map<int, int> knownConst;  // slot -> const value (within BB)
+  int chainTip = -1;                         // active chain tip slot, or -1
+  std::size_t chainConstIdx = 0;             // index of the chain's first Const
+  int chainAccum = 0;                        // accumulated constant (in Add sense)
+  bool chainFirstAdd = true;                 // first Binary's op is Add (vs Sub)
+  auto bbReset = [&]() { knownConst.clear(); chainTip = -1; };
+
+  for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
+    auto &ins = fn.instructions[i];
+    if (ins.op == Op::Label) { bbReset(); continue; }
+
+    if (ins.op == Op::Const && ins.dest != -1 && constDefIndex.count(ins.dest)) {
+      knownConst[ins.dest] = ins.value;
+    }
+
+    const bool isAddSub =
+        ins.binary == ir::BinaryOp::Add || ins.binary == ir::BinaryOp::Sub;
+
+    // Chain extension: Binary t = chainTip +/- c  → bump first Const, rewrite to Move.
+    if (ins.op == Op::Binary && chainTip != -1 && ins.lhs == chainTip &&
+        ins.dest != -1 && ins.dest != chainTip && ins.rhs != -1 && isAddSub) {
+      auto rk = knownConst.find(ins.rhs);
+      if (rk != knownConst.end()) {
+        const int c = (ins.binary == ir::BinaryOp::Add) ? rk->second : -rk->second;
+        chainAccum += c;
+        // The first Binary is `tip = base Add/Sub Const`. Set Const so that
+        // base op Const == base + chainAccum. For Add: Const = chainAccum.
+        // For Sub: Const = -chainAccum (since base - Const = base + chainAccum).
+        fn.instructions[chainConstIdx].value =
+            chainFirstAdd ? chainAccum : -chainAccum;
+        ins.op = Op::Move;
+        ins.lhs = chainTip;
+        ins.rhs = -1;
+        ins.binary = ir::BinaryOp::Add;
+        chainTip = ins.dest;  // t is now a copy of the old tip
+        any = true;
+        continue;
+      }
+    }
+
+    // New chain start: Binary t = base +/- c, where c is a single-def single-use
+    // Const (so bumping it later is safe).
+    if (ins.op == Op::Binary && ins.dest != -1 && ins.lhs != -1 &&
+        ins.dest != ins.lhs && ins.rhs != -1 && isAddSub) {
+      auto rk = knownConst.find(ins.rhs);
+      auto cit = constDefIndex.find(ins.rhs);
+      const int rhsUses = uses.count(ins.rhs) ? uses.at(ins.rhs) : 0;
+      if (rk != knownConst.end() && cit != constDefIndex.end() && rhsUses == 1) {
+        chainTip = ins.dest;
+        chainConstIdx = cit->second;
+        chainFirstAdd = (ins.binary == ir::BinaryOp::Add);
+        chainAccum = chainFirstAdd ? rk->second : -rk->second;
+        continue;
+      }
+    }
+
+    // The chain breaks if the tip is redefined, or at a control boundary.
+    if (definesSlot(ins) && ins.dest != -1 && ins.dest == chainTip) chainTip = -1;
+    if (isControlBoundary(ins)) bbReset();
+  }
+  return any;
+}
+
 void optimizeFunction(ir::Function &fn) {
   for (int iter = 0; iter < 16; ++iter) {
     bool any = false;
@@ -575,6 +721,7 @@ void optimizeFunction(ir::Function &fn) {
     any |= copyPropPass(fn);
     any |= csePass(fn);
     any |= copyCoalescePass(fn);
+    any |= instCombinePass(fn);
     any |= licmPass(fn);
     any |= dcePass(fn);
     if (!any) break;
