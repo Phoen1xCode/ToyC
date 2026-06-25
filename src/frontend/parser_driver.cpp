@@ -1,6 +1,5 @@
 #include "frontend/parser_driver.hpp"
 
-#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -11,7 +10,7 @@ struct yy_buffer_state;
 using YY_BUFFER_STATE = yy_buffer_state *;
 
 extern int yyparse(void);
-extern YY_BUFFER_STATE yy_scan_bytes(const char *bytes, std::size_t len);
+extern YY_BUFFER_STATE yy_scan_bytes(const char *bytes, unsigned long len);
 extern void yy_delete_buffer(YY_BUFFER_STATE buffer);
 extern int yylex_destroy(void);
 
@@ -21,7 +20,7 @@ extern std::unique_ptr<ast::CompUnit> g_parseResult;
 
 std::unique_ptr<ast::CompUnit> parseSource(const std::string &source) {
   g_parseResult.reset();
-  YY_BUFFER_STATE buffer = yy_scan_bytes(source.data(), static_cast<int>(source.size()));
+  YY_BUFFER_STATE buffer = yy_scan_bytes(source.data(), source.size());
   const int result = yyparse();
   yy_delete_buffer(buffer);
   yylex_destroy();
