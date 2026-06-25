@@ -1,0 +1,22 @@
+// p35_branch_fold: 分支常量折叠 + 死分支删除
+// if (0) { ... } 的死分支应被删除(整块不可达);while (1) 的条件 Branch 应被
+// 折叠为 fall-through(去掉 cmp+branch)。
+int dead(int x) {
+  return x * 999;
+}
+int main() {
+  int s = 0;
+  int i = 0;
+  while (1) {
+    if (i >= 10000) {
+      break;
+    }
+    if (0) {
+      s = s + dead(i);
+    } else {
+      s = s + i;
+    }
+    i = i + 1;
+  }
+  return s % 256;
+}

@@ -1,0 +1,17 @@
+// p32_copy_prop_cross_bb: 跨基本块复写传播
+// Move x <- i 在 if 之前的 BB,if 之后读取 x。BB-local copy prop 在 Label 处清空
+// alias,抓不到;全局 copy prop(交集合并)应将 x 的读取替换为 i。
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 5000) {
+    int x = i;
+    if (i % 2 == 0) {
+      s = s + 1;
+    }
+    s = s + x;
+    s = s + x;
+    i = i + 1;
+  }
+  return s % 256;
+}

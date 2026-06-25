@@ -20,6 +20,20 @@
 | `p29_inst_combine` | `instruction-combining-1.sy` | 指令合并 / 窥孔 + 函数内联 | `input=input+1` 重复 80 次 |
 | `p30_dce` | `dead-code-elimination-1.sy` | 死代码消除 + 调用开销 | 150 个未用局部变量，只 `global=i0` 有用 |
 
+注：原计划的 `-2`/`-3` 变体经核对与 `-1` 字节级相同（仅 `.in` 循环次数不同），本地模拟器跑不动那么大的规模，故未迁移。
+
+### p31–p36：针对优化缺口的合成用例
+为即将实现的优化阶段提前准备的回归用例。每个用例针对一个当前编译器做不好、计划改进的优化维度。
+
+| 用例 | 目标阶段 | 考察优化 | 特征 |
+|---|---|---|---|
+| `p31_cse_cross_bb` | Phase 5 全局 CSE | 跨基本块公共子表达式 | `i*2+1` 在 if 前后各算一次，BB-local CSE 抓不到 |
+| `p32_copy_prop_cross_bb` | Phase 4 全局复写传播 | 跨基本块复写传播 | `Move x<-i` 在 if 之前，if 之后读 x |
+| `p33_licm_alias` | Phase 7 LICM 放宽 | LICM 别名分析 | LoadGlobal `read_only` + StoreGlobal `write_only`（不同全局），当前 LICM 拒绝外提 |
+| `p34_regalloc_pressure` | Phase 6 线性扫描寄存器分配 | 寄存器分配压力 | 12 个同时活跃命名变量 + s + i = 14 个，超 s2..s11 的 10 个 |
+| `p35_branch_fold` | Phase 1 分支常量折叠 | 死分支删除 + `while(1)` 折叠 | `if (0)` 死分支 + `while (1)` 条件折叠 |
+| `p36_global_const_chain` | Phase 3 全局常量传播 | 跨基本块常量传播 | 普通变量 `k=17`（非 const）跨 if 传播 |
+
 ## 运行
 
 ```sh

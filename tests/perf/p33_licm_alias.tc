@@ -1,0 +1,17 @@
+// p33_licm_alias: LICM 别名分析
+// 循环内 LoadGlobal(read_only) + StoreGlobal(write_only,不同全局)。
+// 当前 LICM 见到任何 StoreGlobal 就拒绝外提所有 LoadGlobal;
+// 放宽后应外提 read_only 的 LoadGlobal(只有被写的全局才阻断)。
+int read_only = 41;
+int write_only = 0;
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 5000) {
+    int r = read_only * 3 + 7;
+    s = s + r;
+    write_only = write_only + i;
+    i = i + 1;
+  }
+  return s % 256;
+}

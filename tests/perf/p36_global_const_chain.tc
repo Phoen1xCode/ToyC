@@ -1,0 +1,20 @@
+// p36_global_const_chain: 跨基本块常量传播
+// 普通变量 k=17(非 const)在 if 之前定义,if 的两个分支以及 if 之后都使用 k。
+// BB-local const prop 在 Label 处清空 known,抓不到;全局 const prop 应让所有
+// 使用处折叠为字面量 17,进而触发代数化简(k*3 → 51, k*5 → 85)。
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 4000) {
+    int k = 17;
+    int t = 0;
+    if (i % 2 == 0) {
+      t = k * 3;
+    } else {
+      t = k * 5;
+    }
+    s = s + t + k;
+    i = i + 1;
+  }
+  return s % 256;
+}

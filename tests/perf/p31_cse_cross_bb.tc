@@ -1,0 +1,17 @@
+// p31_cse_cross_bb: 跨基本块 CSE
+// 同一表达式 i*2+1 在 if 语句前后各计算一次。BB-local CSE 在 Label 处清空 seen,
+// 抓不到跨 BB 的重复;全局 CSE 应将第二次计算改写为 Move <- t1。
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 8000) {
+    int t1 = i * 2 + 1;
+    if (i % 3 == 0) {
+      s = s + t1;
+    }
+    int t2 = i * 2 + 1;
+    s = s + t2;
+    i = i + 1;
+  }
+  return s % 256;
+}
