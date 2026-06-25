@@ -313,8 +313,14 @@ class Sim:
         if mn=='add': return a+b
         if mn=='sub': return a-b
         if mn=='mul': return to_int(u(a)*u(b))
-        if mn=='mulh': return (u(a)*u(b)) >> 32
+        if mn=='mulh':
+            # signed × signed, high 32 bits. `a` and `b` are already
+            # signed Python ints (to_int normalises).
+            return (a * b) >> 32
         if mn=='mulhu': return (u(a)*u(b)) >> 32
+        if mn=='mulhsu':
+            # signed × unsigned, high 32 bits.
+            return (a * u(b)) >> 32
         if mn=='mulw': return to_int(u(a)*u(b))
         if mn=='div': return self.idiv(a,b)
         if mn=='divu': return u(a)//u(b) if b else -1

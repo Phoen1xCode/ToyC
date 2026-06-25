@@ -1,6 +1,7 @@
 #include "backend/riscv.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <ostream>
 #include <string>
 #include <unordered_map>
@@ -11,6 +12,48 @@
 
 namespace toycc::backend {
 namespace {
+
+// Magic-number signed division (Hacker's Delight, Fig. 10-1). For a divisor
+// d (d != 0, d != ±1, d != ±2^k) compute (M, s, addMarker) so that
+//     x / d  ==  (signed_high32(x * M) [+ x if addMarker]) >>arith s  +  (x<0?1:0)
+// where signed_high32 is the upper 32 bits of the signed 64-bit product.
+// addMarker is true when |M| does not fit in 32 signed bits and we need to
+// add x back after the high-multiply to recover the right magnitude.
+//
+// `d` must satisfy d != 0 && d != 1 && d != -1 && d is not a power of two
+// (or negative power of two). Callers handle those cases separately.
+struct DivMagic {
+  std::int32_t M;
+  int s;
+  bool addMarker;   // need an extra `add a0, hi, x` step
+};
+DivMagic computeDivMagic(int d) {
+  const std::uint32_t twoP31 = 0x80000000u;
+  const std::uint32_t ad = static_cast<std::uint32_t>(d < 0 ? -static_cast<long long>(d) : d);
+  const std::uint32_t t = twoP31 + (static_cast<std::uint32_t>(d) >> 31);  // 2^31 + (d<0?1:0)
+  const std::uint32_t anc = t - 1 - t % ad;  // |nc|
+  int p = 31;
+  std::uint32_t q1 = twoP31 / anc;
+  std::uint32_t r1 = twoP31 - q1 * anc;
+  std::uint32_t q2 = twoP31 / ad;
+  std::uint32_t r2 = twoP31 - q2 * ad;
+  std::uint32_t delta;
+  do {
+    ++p;
+    q1 *= 2; r1 *= 2;
+    if (r1 >= anc) { ++q1; r1 -= anc; }
+    q2 *= 2; r2 *= 2;
+    if (r2 >= ad) { ++q2; r2 -= ad; }
+    delta = ad - r2;
+  } while (q1 < delta || (q1 == delta && r1 == 0));
+  std::int32_t M = static_cast<std::int32_t>(q2 + 1);
+  if (d < 0) M = -M;
+  DivMagic out;
+  out.M = M;
+  out.s = p - 32;
+  out.addMarker = (d > 0 && M < 0) || (d < 0 && M > 0);
+  return out;
+}
 
 int slotOffset(int slot, int savedSRegs) {
   // 局部社于 s-reg 保存区之下：ra/s0 在 s0-4..s0-8，随后被保存的
@@ -513,6 +556,59 @@ class FunctionEmitter {
     return r;
   }
 
+  // 用 magic multiplier 实现 `x / d` 或 `x % d`（d 不为 0/±1/±2^k）。
+  // 算法来自 Hacker's Delight Fig. 10-1：
+  //   q = high32_signed(x * M)
+  //   if (d > 0 && M < 0) q = q + x;     // addMarker
+  //   if (d < 0 && M > 0) q = q - x;     // 用同一个 addMarker 标记并取反 src
+  //   q = q >>arith s
+  //   q = q + (x >>logical 31)            // 加上符号位（负数时 +1）
+  //                                       //   d<0 时改为 (-x) >>logical 31
+  // 对 d<0 的修正：先令 ad = |d|，按 ad 计算，再 neg 结果。我们采用更直接
+  // 的形式：让 magic 自带符号（M 的符号已在 computeDivMagic 中处理）。
+  void emitDivByConst(const ir::Instruction &inst, int d, bool isMod) {
+    const auto m = computeDivMagic(d);
+    // 把 src 放到 t0（不能是 a0，整个序列中要重复读 src）。
+    const std::string lhsReg = slotInReg(inst.lhs);
+    const std::string src = (lhsReg.empty() || lhsReg == "a0")
+        ? (loadSlot("t0", inst.lhs), std::string("t0"))
+        : lhsReg;
+    killReg("a0");
+    // li t1, M
+    out_ << "  li t1, " << m.M << "\n";
+    // mulh a0, src, t1 — signed × signed -> high 32
+    out_ << "  mulh a0, " << src << ", t1\n";
+    if (m.addMarker) {
+      if (d > 0)
+        out_ << "  add a0, a0, " << src << "\n";
+      else
+        out_ << "  sub a0, a0, " << src << "\n";
+    }
+    if (m.s > 0) out_ << "  srai a0, a0, " << m.s << "\n";
+    // q = q + (sign-bit of dividend). For negative d, the dividend's sign
+    // contribution flips: standard form is q = q + (d<0 ? -x : x) >>u 31.
+    if (d > 0) {
+      out_ << "  srli t1, " << src << ", 31\n"
+           << "  add a0, a0, t1\n";
+    } else {
+      // For negative d we want q = q + (-x >>u 31), i.e. add 1 when x > 0.
+      // After computing M with negated sign, the standard fix is the same
+      // formula but reading the sign of the (signed) high product 'a0'.
+      // Hacker's Delight gives: q += (q >>u 31). Use that.
+      out_ << "  srli t1, a0, 31\n"
+           << "  add a0, a0, t1\n";
+    }
+    if (!isMod) {
+      storeSlot("a0", inst.dest);
+      return;
+    }
+    // x % d = x - (x/d)*d
+    out_ << "  li t1, " << d << "\n"
+         << "  mul a0, a0, t1\n"
+         << "  sub a0, " << src << ", a0\n";
+    storeSlot("a0", inst.dest);
+  }
+
   void emitBinary(const ir::Instruction &inst) {
     int kr = 0, kl = 0;
     const bool rConst = isConstSlot(inst.rhs, kr);
@@ -605,6 +701,11 @@ class FunctionEmitter {
             storeSlot("a0", inst.dest);
             return;
           }
+          // 非 2 幂常数除法 → magic multiplier。
+          if (kr != 0 && kr != 1 && kr != -1) {
+            emitDivByConst(inst, kr, /*isMod=*/false);
+            return;
+          }
           break;
         case ir::BinaryOp::Mod:
           if (kr == 1 || kr == -1) {
@@ -626,6 +727,11 @@ class FunctionEmitter {
                  << "  slli a0, a0, " << k << "\n"
                  << "  sub a0, " << src << ", a0\n";
             storeSlot("a0", inst.dest);
+            return;
+          }
+          // 非 2 幂常数取模 → x - (x/c)*c。
+          if (kr != 0 && kr != 1 && kr != -1) {
+            emitDivByConst(inst, kr, /*isMod=*/true);
             return;
           }
           break;
