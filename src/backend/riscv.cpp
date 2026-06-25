@@ -701,11 +701,7 @@ class FunctionEmitter {
             storeSlot("a0", inst.dest);
             return;
           }
-          // 非 2 幂常数除法 → magic multiplier。
-          if (kr != 0 && kr != 1 && kr != -1) {
-            emitDivByConst(inst, kr, /*isMod=*/false);
-            return;
-          }
+          // 非 2 幂常数除法：回退到 div 指令（避免 emit mulh，某些平台模拟器不支持）。
           break;
         case ir::BinaryOp::Mod:
           if (kr == 1 || kr == -1) {
@@ -729,11 +725,7 @@ class FunctionEmitter {
             storeSlot("a0", inst.dest);
             return;
           }
-          // 非 2 幂常数取模 → x - (x/c)*c。
-          if (kr != 0 && kr != 1 && kr != -1) {
-            emitDivByConst(inst, kr, /*isMod=*/true);
-            return;
-          }
+          // 非 2 幂常数取模：回退到 rem 指令。
           break;
         default:
           break;
