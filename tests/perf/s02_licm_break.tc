@@ -1,0 +1,12 @@
+// LICM with break: loop body has invariant, but exits early. Still sound.
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 100) {
+    int inv = 42;
+    s = s + inv;
+    if (s > 200) break;
+    i = i + 1;
+  }
+  return s % 256;
+}

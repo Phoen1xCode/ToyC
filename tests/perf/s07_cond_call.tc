@@ -1,0 +1,14 @@
+// Mixed: function call inside loop, result not always used
+int helper(int x) { return x * 3 + 1; }
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 1000) {
+    int r = helper(i);
+    if (i % 2 == 0) {
+      s = s + r;
+    }
+    i = i + 1;
+  }
+  return s % 256;
+}

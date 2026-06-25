@@ -1,5 +1,7 @@
 #include "ir/optim.hpp"
 
+#include "ir/cfg.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <queue>
@@ -639,6 +641,41 @@ bool copyCoalescePass(ir::Function &fn) {
   return any;
 }
 
+// Compute the set of "pure" function names in a program. A function is pure
+// iff it has no StoreGlobal and calls no impure function (transitively). Pure
+// functions don't modify global state, so a Call to a pure function doesn't
+// invalidate loop-invariant LoadGlobals the way an impure Call might.
+//
+// Fixed-point iteration: start with all functions pure, then iteratively
+// mark impure any function that has a StoreGlobal or calls an impure
+// function. Recursion is handled implicitly — a self-recursive function that
+// writes a global will be marked impure on the first sweep.
+std::unordered_set<std::string> computePureFunctions(
+    const std::vector<ir::Function> &fns) {
+  std::unordered_set<std::string> pure;
+  for (const auto &f : fns) pure.insert(f.name);
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &f : fns) {
+      if (!pure.count(f.name)) continue;
+      bool impure = false;
+      for (const auto &inst : f.instructions) {
+        if (inst.op == Op::StoreGlobal) { impure = true; break; }
+        if (inst.op == Op::Call && !pure.count(inst.name)) {
+          impure = true;
+          break;
+        }
+      }
+      if (impure) {
+        pure.erase(f.name);
+        changed = true;
+      }
+    }
+  }
+  return pure;
+}
+
 // ---------------------------------------------------------------------------
 // Loop-invariant code motion (LICM) for `while` loops.
 //
@@ -663,14 +700,19 @@ bool copyCoalescePass(ir::Function &fn) {
 // It *does* hoist `inv = base*3 + base` (base from outside) and `t = a + b`
 // where a, b are loop-invariant params — exactly the hoist-1 pattern.
 //
-// LoadGlobal is treated as invariant only if no StoreGlobal to any global
-// occurs in the loop body (without alias analysis we cannot be more precise).
-// Calls inside the loop conservatively block hoisting of anything that
-// appears after the call (a callee may write globals or observable state).
+// LoadGlobal is treated as invariant iff no StoreGlobal to the SAME global
+// occurs in the loop body (per-global alias check — a StoreGlobal to a
+// different global doesn't invalidate a LoadGlobal of this global).
+// Calls inside the loop block hoisting of anything after an IMPURE call (a
+// callee that may write globals). A pure callee (no StoreGlobal, no impure
+// Call) doesn't write globals, so it doesn't block subsequent LoadGlobal
+// hoisting. Purity is precomputed at the program level by
+// `computePureFunctions` and passed in.
 //
 // We hoist one loop per outer iteration (positions shift after a rebuild),
 // iterating to a fixed point.
-bool licmPass(ir::Function &fn) {
+bool licmPass(ir::Function &fn,
+              const std::unordered_set<std::string> &pureFunctions) {
   bool any = false;
   bool changed = true;
   while (changed) {
@@ -713,11 +755,34 @@ bool licmPass(ir::Function &fn) {
       const std::size_t bodyEnd = endIdx;
 
       std::unordered_map<int, int> defCount;
-      bool anyStoreGlobal = false;
+      std::unordered_set<std::string> storedGlobals;
       for (std::size_t j = bodyStart; j < bodyEnd; ++j) {
         const auto &ins = fn.instructions[j];
-        if (ins.op == Op::StoreGlobal) anyStoreGlobal = true;
-        if (definesSlot(ins) && ins.dest != -1) ++defCount[ins.dest];
+        if (ins.op == Op::StoreGlobal) storedGlobals.insert(ins.name);
+        // Count Call dests explicitly: `definesSlot` excludes Call (so dcePass
+        // doesn't try to DCE Calls), but for LICM's invariant analysis a Call
+        // DOES define its dest slot. Without this, a pure Call's dest would
+        // have defCount=0 and be wrongly treated as invariant, causing
+        // instructions that read it to be hoisted (the Call result changes
+        // every iteration even if the args are invariant).
+        if (ins.op == Op::Call) {
+          if (ins.dest != -1) ++defCount[ins.dest];
+        } else if (definesSlot(ins) && ins.dest != -1) {
+          ++defCount[ins.dest];
+        }
+      }
+      // Soundness guard: a hoisted store to slot D is only safe if the loop
+      // is guaranteed to execute ≥1 iteration. Without trip-count analysis
+      // we conservatively refuse to hoist any instruction whose dest is read
+      // AFTER the loop (between endIdx and the function's end). Such a slot
+      // is "live out" of the loop — hoisting a `Const D = ...` or `Binary D =`
+      // would change D's value on zero-trip paths. Reads inside the loop are
+      // fine (the hoisted def still dominates them); the bug is when the
+      // hoisted value persists past `while (0) { D = 1; }` and a subsequent
+      // read sees 1 instead of the pre-loop value.
+      std::unordered_set<int> liveOutSlots;
+      for (std::size_t j = endIdx + 1; j < fn.instructions.size(); ++j) {
+        for (int s : readsOf(fn.instructions[j])) liveOutSlots.insert(s);
       }
       std::unordered_set<int> invariant;
       auto isInvariantSlot = [&](int s) {
@@ -726,14 +791,22 @@ bool licmPass(ir::Function &fn) {
       };
 
       std::vector<bool> hoist(fn.instructions.size(), false);
-      bool sawCall = false;
+      bool sawImpureCall = false;
       for (std::size_t j = bodyStart; j < bodyEnd; ++j) {
         const auto &ins = fn.instructions[j];
-        if (ins.op == Op::Call) { sawCall = true; continue; }
+        if (ins.op == Op::Call) {
+          if (!pureFunctions.count(ins.name)) sawImpureCall = true;
+          continue;
+        }
         if (!definesSlot(ins) || ins.dest == -1) continue;
-        if (sawCall) continue;
+        if (sawImpureCall) continue;
         if (defCount[ins.dest] != 1) continue;
-        if (ins.op == Op::LoadGlobal && anyStoreGlobal) continue;
+        if (ins.op == Op::LoadGlobal && storedGlobals.count(ins.name)) continue;
+        // Refuse to hoist a def whose slot is read after the loop — hoisting
+        // would corrupt the zero-trip path. (`Const`/`Binary`/`Unary`/`Move`
+        // all write to dest; `LoadGlobal` too.) Pure-computation hoists where
+        // the dest is dead after the loop remain safe and are still hoisted.
+        if (liveOutSlots.count(ins.dest)) continue;
         bool ok = true;
         for (int s : readsOf(ins))
           if (!isInvariantSlot(s)) { ok = false; break; }
@@ -741,6 +814,11 @@ bool licmPass(ir::Function &fn) {
         hoist[j] = true;
         defCount[ins.dest] = 0;
         invariant.insert(ins.dest);
+        if (getenv("TOYCC_DUMP_LICM")) {
+          fprintf(stderr, "  HOIST [%zu] op=%d dest=%d in %s (cond=%s)\n",
+              j, (int)ins.op, ins.dest, fn.name.c_str(),
+              fn.instructions[ci].label.c_str());
+        }
       }
 
       bool hoistedAny = false;
@@ -827,6 +905,14 @@ bool instCombinePass(ir::Function &fn) {
     if (defCount[it->first] != 1) it = constDefIndex.erase(it); else ++it;
 
   std::unordered_map<int, int> knownConst;  // slot -> const value (within BB)
+  // Global const map: single-def Consts have a fixed value across the whole
+  // function, so we can look them up even after a Label resets the per-BB
+  // knownConst. Without this, a loop body Binary like `t = acc + 81` (where
+  // the 81 Const lives at the function top, above several Labels) would fail
+  // to start a chain — the per-BB map is empty after the Labels.
+  std::unordered_map<int, int> globalConst;
+  for (const auto &kv : constDefIndex)
+    globalConst[kv.first] = fn.instructions[kv.second].value;
   int chainTip = -1;                         // active chain tip slot, or -1
   std::size_t chainConstIdx = 0;             // index of the chain's first Const
   int chainAccum = 0;                        // accumulated constant (in Add sense)
@@ -847,9 +933,20 @@ bool instCombinePass(ir::Function &fn) {
     // Chain extension: Binary t = chainTip +/- c  → bump first Const, rewrite to Move.
     if (ins.op == Op::Binary && chainTip != -1 && ins.lhs == chainTip &&
         ins.dest != -1 && ins.dest != chainTip && ins.rhs != -1 && isAddSub) {
+      // Look up rhs as a const: prefer per-BB knownConst (handles locals that
+      // are redefined per BB), fall back to globalConst (single-def Consts
+      // whose value is fixed across the whole function).
       auto rk = knownConst.find(ins.rhs);
-      if (rk != knownConst.end()) {
-        const int c = (ins.binary == ir::BinaryOp::Add) ? rk->second : -rk->second;
+      bool found = (rk != knownConst.end());
+      int cv = 0;
+      if (!found) {
+        auto gk = globalConst.find(ins.rhs);
+        if (gk != globalConst.end()) { found = true; cv = gk->second; }
+      } else {
+        cv = rk->second;
+      }
+      if (found) {
+        const int c = (ins.binary == ir::BinaryOp::Add) ? cv : -cv;
         chainAccum += c;
         // The first Binary is `tip = base Add/Sub Const`. Set Const so that
         // base op Const == base + chainAccum. For Add: Const = chainAccum.
@@ -871,13 +968,21 @@ bool instCombinePass(ir::Function &fn) {
     if (ins.op == Op::Binary && ins.dest != -1 && ins.lhs != -1 &&
         ins.dest != ins.lhs && ins.rhs != -1 && isAddSub) {
       auto rk = knownConst.find(ins.rhs);
+      bool found = (rk != knownConst.end());
+      int cv = 0;
+      if (!found) {
+        auto gk = globalConst.find(ins.rhs);
+        if (gk != globalConst.end()) { found = true; cv = gk->second; }
+      } else {
+        cv = rk->second;
+      }
       auto cit = constDefIndex.find(ins.rhs);
       const int rhsUses = uses.count(ins.rhs) ? uses.at(ins.rhs) : 0;
-      if (rk != knownConst.end() && cit != constDefIndex.end() && rhsUses == 1) {
+      if (found && cit != constDefIndex.end() && rhsUses == 1) {
         chainTip = ins.dest;
         chainConstIdx = cit->second;
         chainFirstAdd = (ins.binary == ir::BinaryOp::Add);
-        chainAccum = chainFirstAdd ? rk->second : -rk->second;
+        chainAccum = chainFirstAdd ? cv : -cv;
         continue;
       }
     }
@@ -935,8 +1040,696 @@ bool tailCallPass(ir::Function &fn) {
   return any;
 }
 
-void optimizeFunction(ir::Function &fn) {
+// Global constant propagation across basic blocks.
+//
+// Runs a forward dataflow on the CFG: IN[BB] = intersection of OUT[preds]
+// (a slot is const at IN only if ALL preds agree on its value), OUT[BB] =
+// transfer(IN[BB]) walking the BB's instructions. Iterates to fixed point.
+// Then rewrites each BB seeded with IN[BB] — same rewrites as constFoldPass
+// (Move<-const → Const, fold Unary/Binary, algebraic simplification) but with
+// cross-BB constants.
+//
+// Soundness:
+// - "All-preds-agree" merge: at a loop header, the pre-header says `i=0` and
+//   the back-edge says `i=i+1` (not const) → intersection is empty → i is not
+//   const at the header. Correct.
+// - Call clears inst.dest (return value unknown) but does NOT kill local
+//   consts — they're in slots, not globals. LoadGlobal already doesn't set
+//   known (global values aren't compile-time constants), so Call can't
+//   invalidate them.
+// - StoreGlobal doesn't affect local slots' const-ness.
+//
+// Runs ONCE at the start of optimizeFunction; the local passes then iterate
+// to fixed point. Running the dataflow 16× (once per fixed-point iter) would
+// be wasteful.
+bool globalConstPropPass(ir::Function &fn) {
+  CFG cfg = buildCFG(fn);
+  if (cfg.blocks.empty()) return false;
+
+  // Transfer: walk a BB's instructions starting from `known`, return the
+  // final known map. Pure (no mutation of fn).
+  auto transferFn = [&](std::unordered_map<int, int> known,
+                        const BasicBlock &bb)
+      -> std::unordered_map<int, int> {
+    for (std::size_t i = bb.startIdx; i <= bb.endIdx; ++i) {
+      const auto &inst = fn.instructions[i];
+      switch (inst.op) {
+        case Op::Const:
+          if (inst.dest != -1) known[inst.dest] = inst.value;
+          break;
+        case Op::Move: {
+          if (inst.dest != -1) known.erase(inst.dest);
+          auto it = known.find(inst.lhs);
+          if (it != known.end() && inst.dest != -1) known[inst.dest] = it->second;
+          break;
+        }
+        case Op::Unary: {
+          if (inst.dest != -1) known.erase(inst.dest);
+          auto it = known.find(inst.lhs);
+          if (it != known.end() && inst.dest != -1)
+            known[inst.dest] = foldConstUnary(inst.unary, it->second);
+          break;
+        }
+        case Op::Binary: {
+          if (inst.dest != -1) known.erase(inst.dest);
+          auto lk = known.find(inst.lhs);
+          auto rk = known.find(inst.rhs);
+          if (lk != known.end() && rk != known.end() && inst.dest != -1)
+            known[inst.dest] = foldConstBinary(inst.binary, lk->second, rk->second);
+          break;
+        }
+        case Op::LoadGlobal:
+          if (inst.dest != -1) known.erase(inst.dest);
+          break;
+        case Op::Call:
+          if (inst.dest != -1) known.erase(inst.dest);
+          break;
+        case Op::StoreGlobal:
+          break;
+        default:
+          break;
+      }
+    }
+    return known;
+  };
+
+  std::vector<std::unordered_map<int, int>> in(cfg.blocks.size());
+  std::vector<std::unordered_map<int, int>> out(cfg.blocks.size());
+
+  bool dfChanged = true;
+  int dfIter = 0;
+  while (dfChanged && dfIter < 20) {
+    dfChanged = false;
+    ++dfIter;
+    for (std::size_t b = 0; b < cfg.blocks.size(); ++b) {
+      // IN[b] = intersection of OUT[preds] (all-preds-agree).
+      // The entry block's IN is the boundary condition: {} (no constants come
+      // from outside the function). Without this, a loop-header entry (e.g.,
+      // tail_entry after tailCallPass) would inherit constants from the
+      // back-edge, wrongly concluding that params are const.
+      std::unordered_map<int, int> newIn;
+      if (b == cfg.entryBlock) {
+        newIn = {};
+      } else if (!cfg.blocks[b].preds.empty()) {
+        newIn = out[cfg.blocks[b].preds[0]];
+        for (std::size_t k = 1; k < cfg.blocks[b].preds.size(); ++k) {
+          const auto &predOut = out[cfg.blocks[b].preds[k]];
+          for (auto it = newIn.begin(); it != newIn.end();) {
+            auto jt = predOut.find(it->first);
+            if (jt == predOut.end() || jt->second != it->second)
+              it = newIn.erase(it);
+            else
+              ++it;
+          }
+        }
+      }
+      auto newOut = transferFn(newIn, cfg.blocks[b]);
+      if (newIn != in[b] || newOut != out[b]) {
+        in[b] = std::move(newIn);
+        out[b] = std::move(newOut);
+        dfChanged = true;
+      }
+    }
+  }
+  if (getenv("TOYCC_DUMP_GCP")) {
+    fprintf(stderr, "=== GCP Function %s (dfIters=%d) ===\n", fn.name.c_str(), dfIter);
+    for (std::size_t b = 0; b < cfg.blocks.size(); ++b) {
+      fprintf(stderr, "  BB%zu [%zu..%zu] label=%s preds=", b, cfg.blocks[b].startIdx, cfg.blocks[b].endIdx, cfg.blocks[b].label.c_str());
+      for (auto p : cfg.blocks[b].preds) fprintf(stderr, "%zu ", p);
+      fprintf(stderr, " succs=");
+      for (auto s : cfg.blocks[b].succs) fprintf(stderr, "%zu ", s);
+      fprintf(stderr, "\n    IN={");
+      for (auto &kv : in[b]) fprintf(stderr, "%d:%d ", kv.first, kv.second);
+      fprintf(stderr, "} OUT={");
+      for (auto &kv : out[b]) fprintf(stderr, "%d:%d ", kv.first, kv.second);
+      fprintf(stderr, "}\n");
+    }
+  }
+
+  // Rewrite phase: walk each BB seeded with IN[b], apply constFold rewrites.
+  bool any = false;
+  for (std::size_t b = 0; b < cfg.blocks.size(); ++b) {
+    std::unordered_map<int, int> known = in[b];
+    auto clearDef = [&](int slot) {
+      if (slot != -1) known.erase(slot);
+    };
+    for (std::size_t i = cfg.blocks[b].startIdx; i <= cfg.blocks[b].endIdx; ++i) {
+      auto &inst = fn.instructions[i];
+      switch (inst.op) {
+        case Op::Const:
+          if (inst.dest != -1) known[inst.dest] = inst.value;
+          break;
+        case Op::Move: {
+          clearDef(inst.dest);
+          auto it = known.find(inst.lhs);
+          if (it != known.end()) {
+            int v = it->second;
+            inst.op = Op::Const;
+            inst.value = v;
+            inst.lhs = -1;
+            known[inst.dest] = v;
+            any = true;
+          }
+          break;
+        }
+        case Op::Unary: {
+          clearDef(inst.dest);
+          auto it = known.find(inst.lhs);
+          if (it != known.end()) {
+            int v = foldConstUnary(inst.unary, it->second);
+            inst.op = Op::Const;
+            inst.value = v;
+            inst.unary = ir::UnaryOp::Plus;
+            inst.lhs = -1;
+            known[inst.dest] = v;
+            any = true;
+          }
+          break;
+        }
+        case Op::Binary: {
+          clearDef(inst.dest);
+          auto lk = known.find(inst.lhs);
+          auto rk = known.find(inst.rhs);
+          const bool lc = (lk != known.end());
+          const bool rc = (rk != known.end());
+          if (lc && rc) {
+            int v = foldConstBinary(inst.binary, lk->second, rk->second);
+            inst.op = Op::Const;
+            inst.value = v;
+            inst.binary = ir::BinaryOp::Add;
+            inst.lhs = inst.rhs = -1;
+            known[inst.dest] = v;
+            any = true;
+            break;
+          }
+          switch (inst.binary) {
+            case ir::BinaryOp::Add:
+              if (lc && lk->second == 0) {
+                inst.op = Op::Move; inst.lhs = inst.rhs; inst.rhs = -1; any = true;
+              } else if (rc && rk->second == 0) {
+                inst.op = Op::Move; inst.rhs = -1; any = true;
+              }
+              break;
+            case ir::BinaryOp::Sub:
+              if (rc && rk->second == 0) {
+                inst.op = Op::Move; inst.rhs = -1; any = true;
+              } else if (lc && lk->second == 0) {
+                inst.op = Op::Unary;
+                inst.unary = ir::UnaryOp::Minus;
+                inst.lhs = inst.rhs;
+                inst.rhs = -1;
+                any = true;
+              }
+              break;
+            case ir::BinaryOp::Mul:
+              if ((lc && lk->second == 0) || (rc && rk->second == 0)) {
+                inst.op = Op::Const; inst.value = 0;
+                inst.binary = ir::BinaryOp::Add; inst.lhs = inst.rhs = -1;
+                any = true;
+              } else if (lc && lk->second == 1) {
+                inst.op = Op::Move; inst.lhs = inst.rhs; inst.rhs = -1; any = true;
+              } else if (rc && rk->second == 1) {
+                inst.op = Op::Move; inst.rhs = -1; any = true;
+              }
+              break;
+            default:
+              break;
+          }
+          break;
+        }
+        case Op::LoadGlobal:
+          clearDef(inst.dest);
+          break;
+        case Op::Call:
+          clearDef(inst.dest);
+          break;
+        case Op::StoreGlobal:
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return any;
+}
+
+// Global copy propagation across basic blocks.
+//
+// Tracks `Move d <- s` aliases: when d is read, s can be substituted. Runs a
+// forward dataflow on the CFG: IN[BB] = INTERSECTION of OUT[preds] (a copy is
+// substitutable at IN only if ALL preds agree on the same d→s alias), OUT[BB]
+// = transfer(IN[BB]) walking the BB's instructions. Iterates to fixed point.
+// Then rewrites each BB seeded with IN[BB] — same substitutions as
+// copyPropPass but with cross-BB aliases.
+//
+// Soundness — why intersection (not union):
+//   A copy (d, s) is substitutable at a BB only if it holds on EVERY path to
+//   that BB. If one pred has (d, s) and another doesn't (because d or s was
+//   redefined on that path), substituting would read a stale s on the path
+//   where the copy is invalid. Union would be unsound; intersection is
+//   conservative but correct.
+//   At a loop header, a copy from the pre-header is NOT in the back-edge's
+//   OUT if d or s is redefined in the body → intersection drops it → no
+//   substitution at the header. Correct.
+//
+// Kill rules:
+//   - Any def of slot X kills every alias (d, s) where d == X or s == X
+//     (redefining either side invalidates the copy).
+//   - Call: conservatively kill all aliases whose d or s is NOT a param slot
+//     or named slot — actually, since Call only writes globals (not local
+//     slots) and inst.dest, aliases between local slots survive. But the
+//     return value (inst.dest) is a new def, killing aliases involving it.
+//   - LoadGlobal: def of inst.dest, kills aliases involving inst.dest.
+//   - StoreGlobal: no effect on local-slot aliases.
+bool globalCopyPropPass(ir::Function &fn) {
+  CFG cfg = buildCFG(fn);
+  if (cfg.blocks.empty()) return false;
+
+  // Alias map: slot d -> slot s (reads of d can be substituted with s).
+  using AliasMap = std::unordered_map<int, int>;
+
+  auto transferFn = [&](AliasMap known, const BasicBlock &bb) -> AliasMap {
+    auto invalidate = [&](int slot) {
+      if (slot == -1) return;
+      for (auto it = known.begin(); it != known.end();) {
+        if (it->second == slot || it->first == slot) it = known.erase(it);
+        else ++it;
+      }
+    };
+    for (std::size_t i = bb.startIdx; i <= bb.endIdx; ++i) {
+      const auto &inst = fn.instructions[i];
+      switch (inst.op) {
+        case Op::Const:
+          if (inst.dest != -1) invalidate(inst.dest);
+          break;
+        case Op::Move: {
+          // Subst the source first (chain follow happens at rewrite time).
+          int src = inst.lhs;
+          auto it = known.find(src);
+          if (it != known.end()) src = it->second;
+          invalidate(inst.dest);
+          if (inst.dest != -1 && inst.lhs != -1 && inst.dest != inst.lhs)
+            known[inst.dest] = inst.lhs;
+          break;
+        }
+        case Op::Unary: {
+          if (inst.dest != -1) invalidate(inst.dest);
+          break;
+        }
+        case Op::Binary: {
+          if (inst.dest != -1) invalidate(inst.dest);
+          break;
+        }
+        case Op::LoadGlobal:
+          if (inst.dest != -1) invalidate(inst.dest);
+          break;
+        case Op::Call:
+          if (inst.dest != -1) invalidate(inst.dest);
+          break;
+        case Op::StoreGlobal:
+          break;
+        default:
+          break;
+      }
+    }
+    return known;
+  };
+
+  std::vector<AliasMap> in(cfg.blocks.size());
+  std::vector<AliasMap> out(cfg.blocks.size());
+
+  bool dfChanged = true;
+  int dfIter = 0;
+  while (dfChanged && dfIter < 20) {
+    dfChanged = false;
+    ++dfIter;
+    for (std::size_t b = 0; b < cfg.blocks.size(); ++b) {
+      AliasMap newIn;
+      if (b == cfg.entryBlock) {
+        newIn = {};
+      } else if (!cfg.blocks[b].preds.empty()) {
+        newIn = out[cfg.blocks[b].preds[0]];
+        for (std::size_t k = 1; k < cfg.blocks[b].preds.size(); ++k) {
+          const auto &predOut = out[cfg.blocks[b].preds[k]];
+          for (auto it = newIn.begin(); it != newIn.end();) {
+            auto jt = predOut.find(it->first);
+            if (jt == predOut.end() || jt->second != it->second)
+              it = newIn.erase(it);
+            else
+              ++it;
+          }
+        }
+      }
+      auto newOut = transferFn(newIn, cfg.blocks[b]);
+      if (newIn != in[b] || newOut != out[b]) {
+        in[b] = std::move(newIn);
+        out[b] = std::move(newOut);
+        dfChanged = true;
+      }
+    }
+  }
+
+  // Rewrite phase: walk each BB seeded with IN[b], substitute operands.
+  bool any = false;
+  for (std::size_t b = 0; b < cfg.blocks.size(); ++b) {
+    AliasMap known = in[b];
+    auto invalidate = [&](int slot) {
+      if (slot == -1) return;
+      for (auto it = known.begin(); it != known.end();) {
+        if (it->second == slot || it->first == slot) it = known.erase(it);
+        else ++it;
+      }
+    };
+    auto subst = [&](int s) -> int {
+      if (s == -1) return s;
+      int cur = s;
+      int hops = 0;
+      while (hops < 4) {
+        auto it = known.find(cur);
+        if (it == known.end()) break;
+        cur = it->second;
+        ++hops;
+      }
+      return cur;
+    };
+    for (std::size_t i = cfg.blocks[b].startIdx; i <= cfg.blocks[b].endIdx; ++i) {
+      auto &inst = fn.instructions[i];
+      switch (inst.op) {
+        case Op::Const:
+          if (inst.dest != -1) invalidate(inst.dest);
+          break;
+        case Op::Move: {
+          int src = subst(inst.lhs);
+          if (src != inst.lhs) any = true;
+          inst.lhs = src;
+          invalidate(inst.dest);
+          if (inst.dest != -1 && inst.lhs != -1 && inst.dest != inst.lhs)
+            known[inst.dest] = inst.lhs;
+          break;
+        }
+        case Op::Unary: {
+          int s = subst(inst.lhs);
+          if (s != inst.lhs) any = true;
+          inst.lhs = s;
+          invalidate(inst.dest);
+          break;
+        }
+        case Op::Binary: {
+          int l = subst(inst.lhs);
+          int r = subst(inst.rhs);
+          if (l != inst.lhs) any = true;
+          if (r != inst.rhs) any = true;
+          inst.lhs = l; inst.rhs = r;
+          invalidate(inst.dest);
+          break;
+        }
+        case Op::LoadGlobal:
+          if (inst.dest != -1) invalidate(inst.dest);
+          break;
+        case Op::Call:
+          if (inst.dest != -1) invalidate(inst.dest);
+          break;
+        case Op::StoreGlobal: {
+          int s = subst(inst.lhs);
+          if (s != inst.lhs) any = true;
+          inst.lhs = s;
+          break;
+        }
+        case Op::Branch: {
+          int s = subst(inst.lhs);
+          if (s != inst.lhs) any = true;
+          inst.lhs = s;
+          break;
+        }
+        case Op::Return: {
+          int s = subst(inst.lhs);
+          if (s != inst.lhs) any = true;
+          inst.lhs = s;
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+  return any;
+}
+
+// Global common-subexpression elimination via available-expressions dataflow.
+//
+// An expression (BinaryOp, lhsSlot, rhsSlot) is "available" at a program
+// point if it has been computed and none of its operands or its destination
+// has been redefined since. Runs a forward dataflow on the CFG:
+//   IN[BB] = INTERSECTION of OUT[preds] (an expr is available at IN only if
+//            ALL preds computed it and didn't kill it)
+//   OUT[BB] = transfer(IN[BB]) walking the BB's instructions
+// Iterates to fixed point. Then rewrites each BB seeded with IN[BB] — when a
+// Binary's expr is in `avail` and the prior def's slot is still live, replace
+// the Binary with `Move dest <- priorDef`.
+//
+// Soundness:
+// - Intersection: a loop-only expr (computed in the body, not the pre-header)
+//   is NOT available at the header (pre-header's OUT doesn't have it) → not
+//   rewritten at the header. Correct.
+// - Kill on def: any def of slot X kills every expr using X as operand (the
+//   operand's value changed) AND every expr whose defSlot is X (the stored
+//   value changed).
+// - Self-update (dest == lhs or dest == rhs): the expr is computed with OLD
+//   operands and stored to a slot that's also an operand. After the store,
+//   the expr with NEW operands is NOT what was computed. We kill dest but do
+//   NOT add the expr to avail. We also do NOT rewrite self-updates (the
+//   prior expr used the old operand, rewriting would lose the update).
+//
+// Expression key encoding: (op << 40) | (a << 20) | b, where (a, b) is the
+// commutative-normalized operand pair (smaller first for Add/Mul). 20 bits
+// per operand (1M slots), 24 bits for op. No const encoding — const-fold
+// already handled constant operands.
+bool globalCsePass(ir::Function &fn) {
+  CFG cfg = buildCFG(fn);
+  if (cfg.blocks.empty()) return false;
+
+  // Const-aware operand encoding: a slot that's known-const is encoded as
+  // 0x40000000 | (value & 0x3FFFFF) so that two different Const slots holding
+  // the same value produce the same expr key. Without this, `i * 2` computed
+  // twice (with two different `Const 2` slots) wouldn't match.
+  auto enc = [](int slot, const std::unordered_map<int, int> &known) -> int {
+    auto it = known.find(slot);
+    if (it != known.end()) return 0x40000000 | (it->second & 0x3FFFFF);
+    return slot;
+  };
+  auto encodeExpr = [&](ir::BinaryOp op, int lhs, int rhs,
+                        const std::unordered_map<int, int> &known) -> uint64_t {
+    int a = enc(lhs, known), b = enc(rhs, known);
+    if ((op == ir::BinaryOp::Add || op == ir::BinaryOp::Mul) && a > b)
+      std::swap(a, b);
+    return ((uint64_t)static_cast<int>(op) << 40) |
+           ((uint64_t)(a & 0xFFFFF) << 20) |
+           (uint64_t)(b & 0xFFFFF);
+  };
+  auto exprA = [](uint64_t k) { return (int)((k >> 20) & 0xFFFFF); };
+  auto exprB = [](uint64_t k) { return (int)(k & 0xFFFFF); };
+
+  using AvailMap = std::unordered_map<uint64_t, int>;  // exprKey -> defSlot
+
+  // Track both `avail` (exprKey -> defSlot) and `known` (slot -> const value)
+  // in the transfer so we can encode const operands. known is updated like
+  // constFoldPass: Const sets, Move<-const propagates, other defs clear.
+  struct TransferState {
+    AvailMap avail;
+    std::unordered_map<int, int> known;
+  };
+  using StateMap = TransferState;
+
+  auto transferFn = [&](StateMap st, const BasicBlock &bb) -> StateMap {
+    auto &avail = st.avail;
+    auto &known = st.known;
+    auto killSlot = [&](int slot) {
+      if (slot == -1) return;
+      known.erase(slot);
+      for (auto it = avail.begin(); it != avail.end();) {
+        if (it->second == slot || exprA(it->first) == slot ||
+            exprB(it->first) == slot)
+          it = avail.erase(it);
+        else
+          ++it;
+      }
+    };
+    for (std::size_t i = bb.startIdx; i <= bb.endIdx; ++i) {
+      const auto &inst = fn.instructions[i];
+      switch (inst.op) {
+        case Op::Const:
+          if (inst.dest != -1) { known[inst.dest] = inst.value; killSlot(inst.dest); known[inst.dest] = inst.value; }
+          break;
+        case Op::Move: {
+          if (inst.dest != -1) killSlot(inst.dest);
+          auto it = known.find(inst.lhs);
+          if (it != known.end() && inst.dest != -1) known[inst.dest] = it->second;
+          break;
+        }
+        case Op::Unary: {
+          if (inst.dest != -1) killSlot(inst.dest);
+          break;
+        }
+        case Op::Binary: {
+          if (inst.dest != -1) killSlot(inst.dest);
+          const bool selfUpdate =
+              (inst.dest == inst.lhs) || (inst.dest == inst.rhs);
+          if (!selfUpdate && inst.dest != -1 && inst.lhs != -1 &&
+              inst.rhs != -1) {
+            uint64_t key = encodeExpr(inst.binary, inst.lhs, inst.rhs, known);
+            avail[key] = inst.dest;
+          }
+          // Folded-const dest: if both operands known, dest is known too.
+          auto lk = known.find(inst.lhs);
+          auto rk = known.find(inst.rhs);
+          if (lk != known.end() && rk != known.end() && inst.dest != -1)
+            known[inst.dest] = foldConstBinary(inst.binary, lk->second, rk->second);
+          break;
+        }
+        case Op::LoadGlobal:
+        case Op::Call:
+          if (inst.dest != -1) killSlot(inst.dest);
+          break;
+        default:
+          break;
+      }
+    }
+    return st;
+  };
+
+  // Dataflow: IN[BB] = intersection of OUT[preds]. For avail, require same
+  // defSlot. For known, require same value (intersection). They're coupled:
+  // an expr's encoding depends on known, so we carry both together.
+  std::vector<StateMap> in(cfg.blocks.size());
+  std::vector<StateMap> out(cfg.blocks.size());
+
+  auto mergeState = [](const StateMap &a, const StateMap &b) -> StateMap {
+    StateMap r;
+    // Merge avail: keep entries where both agree on defSlot.
+    for (const auto &kv : a.avail) {
+      auto it = b.avail.find(kv.first);
+      if (it != b.avail.end() && it->second == kv.second)
+        r.avail[kv.first] = kv.second;
+    }
+    // Merge known: keep entries where both agree on value.
+    for (const auto &kv : a.known) {
+      auto it = b.known.find(kv.first);
+      if (it != b.known.end() && it->second == kv.second)
+        r.known[kv.first] = kv.second;
+    }
+    return r;
+  };
+
+  bool dfChanged = true;
+  int dfIter = 0;
+  while (dfChanged && dfIter < 20) {
+    dfChanged = false;
+    ++dfIter;
+    for (std::size_t b = 0; b < cfg.blocks.size(); ++b) {
+      StateMap newIn;
+      if (b == cfg.entryBlock) {
+        // entry: empty
+      } else if (!cfg.blocks[b].preds.empty()) {
+        newIn = out[cfg.blocks[b].preds[0]];
+        for (std::size_t k = 1; k < cfg.blocks[b].preds.size(); ++k) {
+          newIn = mergeState(newIn, out[cfg.blocks[b].preds[k]]);
+        }
+      }
+      auto newOut = transferFn(newIn, cfg.blocks[b]);
+      if (newIn.avail != in[b].avail || newOut.avail != out[b].avail ||
+          newIn.known != in[b].known || newOut.known != out[b].known) {
+        in[b] = std::move(newIn);
+        out[b] = std::move(newOut);
+        dfChanged = true;
+      }
+    }
+  }
+
+  // Rewrite phase: walk each BB seeded with IN[b]. When a Binary's expr is in
+  // `avail` and the prior def is still live (not killed since), rewrite to
+  // Move dest <- priorDef.
+  bool any = false;
+  for (std::size_t b = 0; b < cfg.blocks.size(); ++b) {
+    StateMap st = in[b];
+    auto &avail = st.avail;
+    auto &known = st.known;
+    auto killSlot = [&](int slot) {
+      if (slot == -1) return;
+      known.erase(slot);
+      for (auto it = avail.begin(); it != avail.end();) {
+        if (it->second == slot || exprA(it->first) == slot ||
+            exprB(it->first) == slot)
+          it = avail.erase(it);
+        else
+          ++it;
+      }
+    };
+    for (std::size_t i = cfg.blocks[b].startIdx; i <= cfg.blocks[b].endIdx; ++i) {
+      auto &inst = fn.instructions[i];
+      switch (inst.op) {
+        case Op::Const:
+          if (inst.dest != -1) { killSlot(inst.dest); known[inst.dest] = inst.value; }
+          break;
+        case Op::Move: {
+          if (inst.dest != -1) killSlot(inst.dest);
+          auto it = known.find(inst.lhs);
+          if (it != known.end() && inst.dest != -1) known[inst.dest] = it->second;
+          break;
+        }
+        case Op::Unary: {
+          if (inst.dest != -1) killSlot(inst.dest);
+          break;
+        }
+        case Op::Binary: {
+          const bool selfUpdate =
+              (inst.dest == inst.lhs) || (inst.dest == inst.rhs);
+          if (!selfUpdate && inst.lhs != -1 && inst.rhs != -1) {
+            uint64_t key = encodeExpr(inst.binary, inst.lhs, inst.rhs, known);
+            auto it = avail.find(key);
+            if (it != avail.end() && it->second != inst.dest &&
+                it->second != inst.lhs && it->second != inst.rhs) {
+              inst.op = Op::Move;
+              inst.lhs = it->second;
+              inst.rhs = -1;
+              inst.binary = ir::BinaryOp::Add;
+              any = true;
+              if (inst.dest != -1) killSlot(inst.dest);
+              break;
+            }
+          }
+          if (inst.dest != -1) killSlot(inst.dest);
+          if (!selfUpdate && inst.dest != -1 && inst.lhs != -1 &&
+              inst.rhs != -1) {
+            uint64_t key = encodeExpr(inst.binary, inst.lhs, inst.rhs, known);
+            avail[key] = inst.dest;
+          }
+          auto lk = known.find(inst.lhs);
+          auto rk = known.find(inst.rhs);
+          if (lk != known.end() && rk != known.end() && inst.dest != -1)
+            known[inst.dest] = foldConstBinary(inst.binary, lk->second, rk->second);
+          break;
+        }
+        case Op::LoadGlobal:
+        case Op::Call:
+          if (inst.dest != -1) killSlot(inst.dest);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return any;
+}
+
+void optimizeFunction(ir::Function &fn,
+                      const std::unordered_set<std::string> &pureFunctions) {
   tailCallPass(fn);  // one-shot restructure before the fixed-point loop
+  // Global dataflow passes run once up front (cross-BB const/copy/CSE), then
+  // the local passes iterate to a fixed point. Running them inside the
+  // 16-iter loop would be wasteful.
+  globalConstPropPass(fn);
+  globalCopyPropPass(fn);
+  globalCsePass(fn);
   for (int iter = 0; iter < 16; ++iter) {
     bool any = false;
     any |= constFoldPass(fn);
@@ -947,8 +1740,17 @@ void optimizeFunction(ir::Function &fn) {
     any |= csePass(fn);
     any |= copyCoalescePass(fn);
     any |= instCombinePass(fn);
-    any |= licmPass(fn);
+    any |= licmPass(fn, pureFunctions);
     any |= dcePass(fn);
+    if (getenv("TOYCC_DUMP_IR")) {
+      fprintf(stderr, "=== %s after iter %d ===\n", fn.name.c_str(), iter);
+      for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
+        const auto &ins = fn.instructions[i];
+        fprintf(stderr, "  [%zu] op=%d dest=%d lhs=%d rhs=%d v=%d bin=%d lab=%s\n",
+            i, (int)ins.op, ins.dest, ins.lhs, ins.rhs, ins.value,
+            (int)ins.binary, ins.label.c_str());
+      }
+    }
     if (!any) break;
   }
 }
@@ -987,23 +1789,12 @@ std::unordered_set<std::string> calleesOf(const ir::Function &fn) {
   return out;
 }
 
-// Does `fn` contain a loop? The IR builder lowers `while` to a fixed label
-// pattern `.L_<fn>_while_cond_N` / `_while_body_N` / `_while_end_N` with a
-// `Goto condLabel` at the end of the body. A back-edge (a Goto whose target
-// Label appears *earlier* than the Goto) is a reliable loop signal without
-// needing a full CFG.
+// Does `fn` contain a loop? Delegates to the shared CFG helper: a back-edge
+// (a successor block index ≤ the current block index) is a reliable loop
+// signal. The earlier implementation scanned for Goto-to-earlier-Label, which
+// is equivalent but duplicated the CFG logic.
 bool hasLoop(const ir::Function &fn) {
-  std::unordered_map<std::string, std::size_t> labelPos;
-  for (std::size_t i = 0; i < fn.instructions.size(); ++i)
-    if (fn.instructions[i].op == Op::Label) labelPos[fn.instructions[i].label] = i;
-  for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
-    const auto &inst = fn.instructions[i];
-    if (inst.op == Op::Goto) {
-      auto it = labelPos.find(inst.label);
-      if (it != labelPos.end() && it->second <= i) return true;
-    }
-  }
-  return false;
+  return hasBackEdge(buildCFG(fn));
 }
 
 // Is `fn` a leaf (contains no Call)? Leaf-only inlining keeps termination
@@ -1271,7 +2062,8 @@ bool inlineCallsInFunction(
 // passes so folded constants / dead defs from inlining are cleaned up.
 // The outer loop repeats: inlining can turn a caller into a leaf that is
 // now itself inlinable elsewhere.
-void inlineProgram(ir::Program &program) {
+void inlineProgram(ir::Program &program,
+                   const std::unordered_set<std::string> &pureFunctions) {
   constexpr int kMaxBody = 400;  // callee body instruction budget (post-cleanup)
   const auto recursive = findRecursive(program.functions);
   std::unordered_map<std::string, const ir::Function *> byName;
@@ -1280,7 +2072,7 @@ void inlineProgram(ir::Program &program) {
   // Pre-shrink every function with local passes so inlinability is judged on
   // the optimized body, not the raw IR (DCE removes dead locals, constFold
   // folds constant arg-driven computations, etc.).
-  for (auto &f : program.functions) optimizeFunction(f);
+  for (auto &f : program.functions) optimizeFunction(f, pureFunctions);
   byName.clear();
   for (auto &f : program.functions) byName[f.name] = &f;
 
@@ -1300,17 +2092,52 @@ void inlineProgram(ir::Program &program) {
     if (!any) break;
     // Cleanup so the next outer iteration judges shrunken bodies and so
     // inlined constants fold.
-    for (auto &f : program.functions) optimizeFunction(f);
+    for (auto &f : program.functions) optimizeFunction(f, pureFunctions);
     byName.clear();
     for (auto &f : program.functions) byName[f.name] = &f;
   }
 }
 
+// Dead function elimination. After inlining, some callees are no longer
+// referenced from `main` (or anywhere reachable). ToyC has no function
+// pointers, so a function is reachable iff transitively called from `main`.
+// Removing dead functions shrinks the emitted .text section — important for
+// platform startup cost on small test binaries.
+void deadFunctionElimination(ir::Program &program) {
+  std::unordered_map<std::string, const ir::Function *> byName;
+  for (const auto &f : program.functions) byName[f.name] = &f;
+  if (!byName.count("main")) return;
+  std::unordered_set<std::string> alive;
+  std::vector<std::string> stack{"main"};
+  while (!stack.empty()) {
+    std::string name = stack.back();
+    stack.pop_back();
+    if (alive.count(name)) continue;
+    alive.insert(name);
+    auto it = byName.find(name);
+    if (it == byName.end()) continue;
+    for (const auto &inst : it->second->instructions)
+      if (inst.op == Op::Call) stack.push_back(inst.name);
+  }
+  std::vector<ir::Function> kept;
+  kept.reserve(program.functions.size());
+  for (auto &f : program.functions)
+    if (alive.count(f.name)) kept.push_back(std::move(f));
+  program.functions = std::move(kept);
+}
+
 void optimizeProgram(ir::Program &program) {
-  inlineProgram(program);
+  // Compute purity once at the start. Purity is stable across inlining: if a
+  // callee has StoreGlobal, inlining copies that StoreGlobal into the caller,
+  // so the caller's purity doesn't change. Computing once avoids re-running
+  // the fixed-point analysis every optimization round.
+  const auto pureFunctions = computePureFunctions(program.functions);
+  inlineProgram(program, pureFunctions);
   // Local passes already ran inside inlineProgram; one final sweep ensures a
   // fixed point.
-  for (auto &fn : program.functions) optimizeFunction(fn);
+  for (auto &fn : program.functions) optimizeFunction(fn, pureFunctions);
+  // Drop functions that are no longer reachable from `main` after inlining.
+  deadFunctionElimination(program);
 }
 
 }  // namespace toycc::ir

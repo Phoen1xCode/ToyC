@@ -1,0 +1,11 @@
+// LICM edge case: loop might not execute (i starts high), inv should NOT be hoisted unsafely
+int main() {
+  int s = 0;
+  int i = 100;
+  while (i < 10) {
+    int inv = 999;
+    s = s + inv;
+    i = i + 1;
+  }
+  return s;
+}

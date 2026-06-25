@@ -1,0 +1,17 @@
+// Binary op chain — every op should write directly to s-reg
+int main() {
+  int a = 0;
+  int b = 0;
+  int c = 0;
+  int i = 0;
+  while (i < 1000) {
+    a = a + i;
+    b = b + a;
+    c = c + b;
+    a = a - 1;
+    b = b + 2;
+    c = c - 3;
+    i = i + 1;
+  }
+  return (a + b + c) % 256;
+}

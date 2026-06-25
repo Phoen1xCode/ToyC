@@ -1,0 +1,14 @@
+// Comparison ops — verify Less/Greater/Equal write to s-reg correctly
+int main() {
+  int cnt = 0;
+  int i = 0;
+  while (i < 100) {
+    int lt = i < 50;
+    int gt = i > 25;
+    int eq = i == 75;
+    int ne = i != 99;
+    cnt = cnt + lt + gt + eq + ne;
+    i = i + 1;
+  }
+  return cnt % 256;
+}

@@ -461,6 +461,49 @@ class FunctionEmitter {
     addCache(slot, regs);
   }
 
+  // Emit `op dst, src1, src2` writing the result directly to `destSlot`'s
+  // home register when possible. If destSlot is in an s-reg sX, we emit
+  // `op sX, src1, src2` — saving a `mv sX, a0` that the prior `OP a0, ...;
+  // storeSlot("a0", dest)` pattern always produced. RISC-V three-operand
+  // non-destructive semantics make this safe even when src1/src2 == sX (the
+  // reads happen before the write). src1/src2 must already be in registers.
+  // Falls back to `op a0, ...; storeSlot` when dest is on the stack.
+  void emitOpToDest(const std::string &op, const std::string &src1,
+                    const std::string &src2, int destSlot) {
+    auto m = regMap_.find(destSlot);
+    if (m != regMap_.end()) {
+      const std::string &dst = m->second;
+      // Writing to sX invalidates any other slot previously held in sX.
+      dropReg(dst);
+      // sRegHeld_ maps t0/a0 → s-reg; if any entry claims t0/a0 holds dst's
+      // old value, that claim is now stale (dst changed, t0/a0 didn't).
+      for (auto it = sRegHeld_.begin(); it != sRegHeld_.end();)
+        if (it->second == dst) it = sRegHeld_.erase(it); else ++it;
+      out_ << "  " << op << " " << dst << ", " << src1 << ", " << src2 << "\n";
+      return;
+    }
+    killReg("a0");
+    out_ << "  " << op << " a0, " << src1 << ", " << src2 << "\n";
+    storeSlot("a0", destSlot);
+  }
+
+  // Same as above but for immediate-form ops: `opi dst, src, imm`.
+  void emitOpImmToDest(const std::string &op, const std::string &src,
+                       int imm, int destSlot) {
+    auto m = regMap_.find(destSlot);
+    if (m != regMap_.end()) {
+      const std::string &dst = m->second;
+      dropReg(dst);
+      for (auto it = sRegHeld_.begin(); it != sRegHeld_.end();)
+        if (it->second == dst) it = sRegHeld_.erase(it); else ++it;
+      out_ << "  " << op << " " << dst << ", " << src << ", " << imm << "\n";
+      return;
+    }
+    killReg("a0");
+    out_ << "  " << op << " a0, " << src << ", " << imm << "\n";
+    storeSlot("a0", destSlot);
+  }
+
   void emitInst(const ir::Instruction &inst) {
     switch (inst.op) {
       case ir::Instruction::Op::Label:
@@ -630,18 +673,14 @@ class FunctionEmitter {
         case ir::BinaryOp::Add:
           if (kr >= -2048 && kr <= 2047) {
             const std::string src = lhsReg.empty() ? (loadSlot("t0", inst.lhs), std::string("t0")) : lhsReg;
-            killReg("a0");
-            out_ << "  addi a0, " << src << ", " << kr << "\n";
-            storeSlot("a0", inst.dest);
+            emitOpImmToDest("addi", src, kr, inst.dest);
             return;
           }
           break;
         case ir::BinaryOp::Sub:
           if (-kr >= -2048 && -kr <= 2047) {
             const std::string src = lhsReg.empty() ? (loadSlot("t0", inst.lhs), std::string("t0")) : lhsReg;
-            killReg("a0");
-            out_ << "  addi a0, " << src << ", " << (-kr) << "\n";
-            storeSlot("a0", inst.dest);
+            emitOpImmToDest("addi", src, -kr, inst.dest);
             return;
           }
           break;
@@ -667,9 +706,7 @@ class FunctionEmitter {
           }
           if (kr > 0 && (kr & (kr - 1)) == 0) {
             const std::string src = lhsReg.empty() ? (loadSlot("t0", inst.lhs), std::string("t0")) : lhsReg;
-            killReg("a0");
-            out_ << "  slli a0, " << src << ", " << log2pow2(kr) << "\n";
-            storeSlot("a0", inst.dest);
+            emitOpImmToDest("slli", src, log2pow2(kr), inst.dest);
             return;
           }
           break;
@@ -745,10 +782,10 @@ class FunctionEmitter {
       switch (inst.binary) {
         case ir::BinaryOp::Add:
           if (kl >= -2048 && kl <= 2047) {
-            loadSlot("t0", inst.rhs);
-            killReg("a0");
-            out_ << "  addi a0, t0, " << kl << "\n";
-            storeSlot("a0", inst.dest);
+            // rhs might be in a reg already; prefer that to avoid a redundant load.
+            const std::string rhsReg = slotInReg(inst.rhs);
+            const std::string src = rhsReg.empty() ? (loadSlot("t0", inst.rhs), std::string("t0")) : rhsReg;
+            emitOpImmToDest("addi", src, kl, inst.dest);
             return;
           }
           break;
@@ -766,10 +803,9 @@ class FunctionEmitter {
             return;
           }
           if (kl > 0 && (kl & (kl - 1)) == 0) {
-            loadSlot("t0", inst.rhs);
-            killReg("a0");
-            out_ << "  slli a0, t0, " << log2pow2(kl) << "\n";
-            storeSlot("a0", inst.dest);
+            const std::string rhsReg = slotInReg(inst.rhs);
+            const std::string src = rhsReg.empty() ? (loadSlot("t0", inst.rhs), std::string("t0")) : rhsReg;
+            emitOpImmToDest("slli", src, log2pow2(kl), inst.dest);
             return;
           }
           break;
@@ -785,12 +821,18 @@ class FunctionEmitter {
     const std::string rhsHere = slotInReg(inst.rhs);
     std::string t0Src;  // lhs operand reg
     std::string a0Src;  // rhs operand reg
+    // If dest is in an s-reg, the result goes there directly (emitOpToDest)
+    // and a0 is NOT clobbered by the op — so we can keep an lhs currently in a0
+    // without spilling to t0, AS LONG AS we don't subsequently load rhs into
+    // a0 (which would clobber lhs). When lhsHere == "a0" and dest is s-reg, we
+    // load rhs into t0 instead and keep lhs in a0.
+    const bool destIsSReg = regMap_.find(inst.dest) != regMap_.end();
 
     if (!lhsHere.empty() && !rhsHere.empty()) {
       // 两个操作数都已在寄存器中。t0Src 不能等于 a0（killReg("a0") 会丢值）
       // 之外，直接用之即可。注意 lhsHere == rhsHere（同一 s-reg 来源）也安全
       // ——op 允许两个 source 相同。
-      if (lhsHere == "a0") {
+      if (lhsHere == "a0" && !destIsSReg) {
         // 即将写 a0；为避免覆盖输入，搬到 t0。
         out_ << "  mv t0, a0\n";
         t0Src = "t0";
@@ -799,16 +841,23 @@ class FunctionEmitter {
       }
       a0Src = rhsHere;
     } else if (!lhsHere.empty()) {
-      // lhs 在 reg；rhs 需 load 到 a0（结果也写 a0 不冲突，因 rhs 是输入端
-      // 先消费才被覆盖——但 RISC-V 三操作数允许）。
-      if (lhsHere == "a0") {
+      if (lhsHere == "a0" && !destIsSReg) {
+        // Old path: dest will be written to a0, so save lhs to t0 first.
         out_ << "  mv t0, a0\n";
         t0Src = "t0";
+        loadSlot("a0", inst.rhs);
+        a0Src = "a0";
+      } else if (lhsHere == "a0" && destIsSReg) {
+        // dest goes to s-reg, so a0 won't be the op's target — but we still
+        // need rhs somewhere. Load rhs into t0 to avoid clobbering lhs in a0.
+        t0Src = "a0";
+        loadSlot("t0", inst.rhs);
+        a0Src = "t0";
       } else {
         t0Src = lhsHere;
+        loadSlot("a0", inst.rhs);
+        a0Src = "a0";
       }
-      loadSlot("a0", inst.rhs);
-      a0Src = "a0";
     } else if (!rhsHere.empty()) {
       // rhs 在 reg；lhs 需 load。把 lhs 放 t0。要小心 load 不要破坏 rhsHere：
       // loadSlot("t0", ...) 只 dropReg("t0")。但若 rhsHere == "t0"，load 会
@@ -826,43 +875,54 @@ class FunctionEmitter {
       loadSlot("a0", inst.rhs);
       t0Src = "t0"; a0Src = "a0";
     }
-    killReg("a0");  // binary op overwrites a0
+    // Single-instruction ops (Add/Sub/Mul/Div/Mod/Less/Greater) write directly
+    // to dest's home reg when possible via emitOpToDest, skipping the
+    // `mv sX, a0` the prior pattern always produced. Compound ops
+    // (LessEqual/GreaterEqual/Equal/NotEqual) emit two instructions and stay
+    // on the a0 path.
     switch (inst.binary) {
       case ir::BinaryOp::Less:
-        out_ << "  slt a0, " << t0Src << ", " << a0Src << "\n";
-        break;
+        emitOpToDest("slt", t0Src, a0Src, inst.dest);
+        return;
       case ir::BinaryOp::Greater:
-        out_ << "  slt a0, " << a0Src << ", " << t0Src << "\n";
-        break;
-      case ir::BinaryOp::LessEqual:
-        out_ << "  slt a0, " << a0Src << ", " << t0Src << "\n  xori a0, a0, 1\n";
-        break;
-      case ir::BinaryOp::GreaterEqual:
-        out_ << "  slt a0, " << t0Src << ", " << a0Src << "\n  xori a0, a0, 1\n";
-        break;
-      case ir::BinaryOp::Equal:
-        out_ << "  sub a0, " << t0Src << ", " << a0Src << "\n  seqz a0, a0\n";
-        break;
-      case ir::BinaryOp::NotEqual:
-        out_ << "  sub a0, " << t0Src << ", " << a0Src << "\n  snez a0, a0\n";
-        break;
+        emitOpToDest("slt", a0Src, t0Src, inst.dest);
+        return;
       case ir::BinaryOp::Add:
-        out_ << "  add a0, " << t0Src << ", " << a0Src << "\n";
-        break;
+        emitOpToDest("add", t0Src, a0Src, inst.dest);
+        return;
       case ir::BinaryOp::Sub:
-        out_ << "  sub a0, " << t0Src << ", " << a0Src << "\n";
-        break;
+        emitOpToDest("sub", t0Src, a0Src, inst.dest);
+        return;
       case ir::BinaryOp::Mul:
-        out_ << "  mul a0, " << t0Src << ", " << a0Src << "\n";
-        break;
+        emitOpToDest("mul", t0Src, a0Src, inst.dest);
+        return;
       case ir::BinaryOp::Div:
-        out_ << "  div a0, " << t0Src << ", " << a0Src << "\n";
-        break;
+        emitOpToDest("div", t0Src, a0Src, inst.dest);
+        return;
       case ir::BinaryOp::Mod:
-        out_ << "  rem a0, " << t0Src << ", " << a0Src << "\n";
-        break;
+        emitOpToDest("rem", t0Src, a0Src, inst.dest);
+        return;
+      case ir::BinaryOp::LessEqual:
+        killReg("a0");
+        out_ << "  slt a0, " << a0Src << ", " << t0Src << "\n  xori a0, a0, 1\n";
+        storeSlot("a0", inst.dest);
+        return;
+      case ir::BinaryOp::GreaterEqual:
+        killReg("a0");
+        out_ << "  slt a0, " << t0Src << ", " << a0Src << "\n  xori a0, a0, 1\n";
+        storeSlot("a0", inst.dest);
+        return;
+      case ir::BinaryOp::Equal:
+        killReg("a0");
+        out_ << "  sub a0, " << t0Src << ", " << a0Src << "\n  seqz a0, a0\n";
+        storeSlot("a0", inst.dest);
+        return;
+      case ir::BinaryOp::NotEqual:
+        killReg("a0");
+        out_ << "  sub a0, " << t0Src << ", " << a0Src << "\n  snez a0, a0\n";
+        storeSlot("a0", inst.dest);
+        return;
     }
-    storeSlot("a0", inst.dest);
   }
 
   void pushA0() { out_ << "  addi sp, sp, -4\n  sw a0, 0(sp)\n"; }
