@@ -271,6 +271,14 @@ class FunctionEmitter {
       out_ << "  mv " << reg << ", " << m->second << "\n";
       return;
     }
+    // 常量 slot：直接 li，不去内存找。这要求 Const 指令本身可以省略 sw。
+    int cv = 0;
+    if (isConstSlot(slot, cv)) {
+      std::string regs(reg);
+      dropReg(regs);
+      out_ << "  li " << reg << ", " << cv << "\n";
+      return;
+    }
     if (const CacheRow *c = findCached(slot)) {
       if (reg != c->reg) {
         out_ << "  mv " << reg << ", " << c->reg << "\n";
@@ -317,6 +325,16 @@ class FunctionEmitter {
         // 这里不清 cache，从而 fall-through 的下一亲 Label 沿用 cache。
         return;
       case ir::Instruction::Op::Const:
+        // 若 slot 是常量表中的成员，所有读取都会通过 loadSlot 直接 li，
+        // 这里就完全省略 li+sw 的发射。但若 slot 是寄存器分配的，s-reg
+        // 仍然需要初始化（loadSlot 的 regAllocated 通路不会查常量表）。
+        {
+          int cv = 0;
+          if (isConstSlot(inst.dest, cv) && cv == inst.value &&
+              !isRegAllocated(inst.dest)) {
+            return;
+          }
+        }
         killReg("a0");
         out_ << "  li a0, " << inst.value << "\n";
         storeSlot("a0", inst.dest);
