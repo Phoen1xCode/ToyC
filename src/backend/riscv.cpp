@@ -51,6 +51,7 @@ class FunctionEmitter {
 
   void emit() {
     allocateRegisters();
+    computeConstSlots();
     frameSize_ = computeFrameSize();
     collectBranchTargets();
     out_ << "  .text\n"
@@ -225,6 +226,43 @@ class FunctionEmitter {
 
   bool isRegAllocated(int slot) const { return regMap_.find(slot) != regMap_.end(); }
 
+  // 把"只被定义为 Op::Const 一次且永不被其他指令重写"的 slot 编入常量表。
+  // 后端在 emitBinary 中据此把 mul/div/rem 常量优化为 shift/and/addi 等等，
+  // 也可以把常量短直接 li 到工作寄存器，省略 sw/lw 的中间往返。
+  std::unordered_map<int, int> slotConst_;
+  void computeConstSlots() {
+    std::unordered_map<int, int> defs;  // slot -> def count
+    std::unordered_map<int, int> values;
+    using Op = ir::Instruction::Op;
+    for (const auto &i : func_.instructions) {
+      switch (i.op) {
+        case Op::Const:
+          if (i.dest != -1) {
+            defs[i.dest] += 1;
+            if (defs[i.dest] == 1) values[i.dest] = i.value;
+          }
+          break;
+        case Op::Move:
+        case Op::LoadGlobal:
+        case Op::Unary:
+        case Op::Binary:
+        case Op::Call:
+          if (i.dest != -1) defs[i.dest] += 2;  // mark non-const def
+          break;
+        default:
+          break;
+      }
+    }
+    for (const auto &kv : defs)
+      if (kv.second == 1) slotConst_[kv.first] = values[kv.first];
+  }
+  bool isConstSlot(int slot, int &outVal) const {
+    auto it = slotConst_.find(slot);
+    if (it == slotConst_.end()) return false;
+    outVal = it->second;
+    return true;
+  }
+
   void loadSlot(const char *reg, int slot) {
     // 被寄存器分配的 slot 其家在 s-reg；不走 cache，也不可被缓存命中
     // （cache 中临时 reg 早已被覆盖）。
@@ -338,7 +376,165 @@ class FunctionEmitter {
     storeSlot("a0", inst.dest);
   }
 
+  // 计算 log2(v)，前提 v 是 2 的幂且 v >= 1
+  static int log2pow2(int v) {
+    int r = 0;
+    while ((1 << r) < v) ++r;
+    return r;
+  }
+
   void emitBinary(const ir::Instruction &inst) {
+    int kr = 0, kl = 0;
+    const bool rConst = isConstSlot(inst.rhs, kr);
+    const bool lConst = isConstSlot(inst.lhs, kl);
+
+    // -------- 强度削减 / addi 折叠：rhs 是已知常量 ----------
+    if (rConst) {
+      switch (inst.binary) {
+        case ir::BinaryOp::Add:
+          if (kr >= -2048 && kr <= 2047) {
+            loadSlot("t0", inst.lhs);
+            killReg("a0");
+            out_ << "  addi a0, t0, " << kr << "\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          break;
+        case ir::BinaryOp::Sub:
+          if (-kr >= -2048 && -kr <= 2047) {
+            loadSlot("t0", inst.lhs);
+            killReg("a0");
+            out_ << "  addi a0, t0, " << (-kr) << "\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          break;
+        case ir::BinaryOp::Mul:
+          if (kr == 0) {
+            killReg("a0");
+            out_ << "  li a0, 0\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          if (kr == 1) {
+            loadSlot("a0", inst.lhs);
+            killReg("a0");
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          if (kr == -1) {
+            loadSlot("t0", inst.lhs);
+            killReg("a0");
+            out_ << "  neg a0, t0\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          if (kr > 0 && (kr & (kr - 1)) == 0) {
+            loadSlot("t0", inst.lhs);
+            killReg("a0");
+            out_ << "  slli a0, t0, " << log2pow2(kr) << "\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          break;
+        case ir::BinaryOp::Div:
+          if (kr == 1) {
+            loadSlot("a0", inst.lhs);
+            killReg("a0");
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          if (kr == -1) {
+            loadSlot("t0", inst.lhs);
+            killReg("a0");
+            out_ << "  neg a0, t0\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          if (kr > 1 && (kr & (kr - 1)) == 0) {
+            // Signed division by 2^k with round-towards-zero (C semantics):
+            //   t1 = x >> 31           (all 1s if x<0, else 0)
+            //   t1 = t1 >>u (32-k)      (k 1s in low bits if x<0 — bias)
+            //   t0 = (x + t1) >>s k
+            const int k = log2pow2(kr);
+            loadSlot("t0", inst.lhs);
+            killReg("a0");
+            out_ << "  srai a0, t0, 31\n"
+                 << "  srli a0, a0, " << (32 - k) << "\n"
+                 << "  add a0, t0, a0\n"
+                 << "  srai a0, a0, " << k << "\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          break;
+        case ir::BinaryOp::Mod:
+          if (kr == 1 || kr == -1) {
+            killReg("a0");
+            out_ << "  li a0, 0\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          if (kr > 1 && (kr & (kr - 1)) == 0) {
+            // Signed rem by 2^k. Compute (x mod 2^k) preserving sign of x:
+            //   t1 = x >> 31; t1 = t1 >>u (32-k);    bias = (x<0 ? 2^k-1 : 0)
+            //   q = (x + bias) >>s k
+            //   r = x - q*2^k = x - (q << k)
+            const int k = log2pow2(kr);
+            loadSlot("t0", inst.lhs);
+            killReg("a0");
+            out_ << "  srai a0, t0, 31\n"
+                 << "  srli a0, a0, " << (32 - k) << "\n"
+                 << "  add a0, t0, a0\n"
+                 << "  srai a0, a0, " << k << "\n"
+                 << "  slli a0, a0, " << k << "\n"
+                 << "  sub a0, t0, a0\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          break;
+        default:
+          break;
+      }
+    }
+    // -------- 强度削减：lhs 是已知常量（仅交换可行的 op）---------
+    if (lConst) {
+      switch (inst.binary) {
+        case ir::BinaryOp::Add:
+          if (kl >= -2048 && kl <= 2047) {
+            loadSlot("t0", inst.rhs);
+            killReg("a0");
+            out_ << "  addi a0, t0, " << kl << "\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          break;
+        case ir::BinaryOp::Mul:
+          if (kl == 0) {
+            killReg("a0");
+            out_ << "  li a0, 0\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          if (kl == 1) {
+            loadSlot("a0", inst.rhs);
+            killReg("a0");
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          if (kl > 0 && (kl & (kl - 1)) == 0) {
+            loadSlot("t0", inst.rhs);
+            killReg("a0");
+            out_ << "  slli a0, t0, " << log2pow2(kl) << "\n";
+            storeSlot("a0", inst.dest);
+            return;
+          }
+          break;
+        default:
+          break;
+      }
+    }
+
+    // -------- 通用回退 ----------
     loadSlot("t0", inst.lhs);
     loadSlot("a0", inst.rhs);
     killReg("a0");  // binary op overwrites a0

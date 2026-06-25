@@ -1,0 +1,31 @@
+caps: steps<= 100,000,000  sim_timeout=30.0s  cc_timeout=20.0s
+name                     refexit   got      status    asm#         steps     sec
+------------------------------------------------------------------------------------
+p01_const.tc                 184   184        PASS      51         1,733    0.04
+p02_dead_code.tc              86    86        PASS      93         5,533    0.04
+p03_copy.tc                  191   191        PASS      57         3,240    0.04
+p04_common_subexpr.tc        140   140        PASS     151        60,041    0.09
+p05_algebra.tc                56    56        PASS      88        50,037    0.08
+p06_tail_recursion.tc        228   228        PASS     148       190,470    0.21
+p07_loop.tc                  120   120        PASS      57       210,035    0.14
+p08_basic_combined.tc         16    16        PASS     124       550,033    0.44
+p09_advanced_graph.tc          4     4        PASS     171        25,851    0.06
+p10_advanced_matrix.tc       123   123        PASS     148     2,985,055    1.59
+p11_global_const_prop.tc     224   224        PASS     109       335,033    0.27
+p12_const_expr_chain.tc      164   164        PASS     105       150,089    0.12
+p13_fib_recursive.tc          32    32        PASS      80     4,351,436    3.29
+p14_modpow.tc                  1     1        PASS     152         5,919    0.04
+p15_ackermann.tc             253   253        PASS     128     1,698,278    1.33
+p16_collatz.tc                67    67        PASS     137         3,533    0.04
+p17_loop_pow.tc               64    64        PASS      73     3,900,033    2.41
+p18_nested_loop.tc           160   160        PASS      90     1,164,043    0.63
+p19_gcd_pairs.tc              64    64        PASS     123       856,568    0.70
+p20_newton_sqrt.tc           100   100        PASS     129         3,599    0.04
+p21_tribonacci.tc            193   193        PASS      95     1,150,285    0.89
+p22_branch_storm.tc          222   222        PASS     168     6,400,035    4.27
+p23_hoist_chain.tc           128   128        PASS     457        66,321    0.09
+p24_div_optim.tc              48    48        PASS     123     4,449,944    3.13
+p25_inst_combine.tc           88    88        PASS     160     6,100,033    5.14
+p26_dce_chain.tc              80    80        PASS      75     3,700,033    2.26
+------------------------------------------------------------------------------------
+PASS 26/26
