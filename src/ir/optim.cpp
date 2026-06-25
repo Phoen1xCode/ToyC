@@ -448,6 +448,126 @@ bool copyCoalescePass(ir::Function &fn) {
   return any;
 }
 
+// ---------------------------------------------------------------------------
+// Loop-invariant code motion (LICM) for `while` loops.
+//
+// The IR builder lowers `while` to a fixed label pattern:
+//     .L_<fn>_while_cond_N:  <cond>; Branch cond, end
+//     .L_<fn>_while_body_N:  <body>; Goto cond
+//     .L_<fn>_while_end_N:
+// We identify each loop by scanning for `while_cond` labels and pairing them
+// with the matching `while_end` label carried in the Branch's falseLabel.
+//
+// A pure defining instruction inside the loop body is invariant and can be
+// hoisted to just before the cond label iff:
+//   (a) it is a pure slot def (Const/Move/Unary/Binary) — side-effecting ops
+//       (Call/StoreGlobal/Branch/Goto/Return) stay put;
+//   (b) every slot it reads is loop-invariant: defined zero times inside the
+//       loop body (it comes from outside the loop, or is a function param);
+//   (c) the slot it defines is defined exactly once inside the loop body
+//       (this instruction) — so hoisting does not strand another in-loop def
+//       that downstream reads expect.
+// This excludes induction variables (`i = i + 1`: `i` is both read and
+// re-defined in the loop) and accumulators (`s = s + inv`: `s` re-defined).
+// It *does* hoist `inv = base*3 + base` (base from outside) and `t = a + b`
+// where a, b are loop-invariant params — exactly the hoist-1 pattern.
+//
+// LoadGlobal is treated as invariant only if no StoreGlobal to any global
+// occurs in the loop body (without alias analysis we cannot be more precise).
+// Calls inside the loop conservatively block hoisting of anything that
+// appears after the call (a callee may write globals or observable state).
+//
+// We hoist one loop per outer iteration (positions shift after a rebuild),
+// iterating to a fixed point.
+bool licmPass(ir::Function &fn) {
+  bool any = false;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    std::unordered_map<std::string, std::size_t> labelPos;
+    for (std::size_t i = 0; i < fn.instructions.size(); ++i)
+      if (fn.instructions[i].op == Op::Label) labelPos[fn.instructions[i].label] = i;
+
+    for (std::size_t ci = 0; ci < fn.instructions.size(); ++ci) {
+      if (fn.instructions[ci].op != Op::Label) continue;
+      if (fn.instructions[ci].label.find("_while_cond_") == std::string::npos) continue;
+      std::string endLab;
+      std::size_t bi = ci + 1;
+      for (; bi < fn.instructions.size(); ++bi) {
+        const auto &x = fn.instructions[bi];
+        if (x.op == Op::Branch) { endLab = x.falseLabel; break; }
+        if (x.op == Op::Goto || x.op == Op::Return || x.op == Op::ReturnVoid) break;
+      }
+      if (endLab.empty()) continue;
+      auto endIt = labelPos.find(endLab);
+      if (endIt == labelPos.end()) continue;
+      const std::size_t endIdx = endIt->second;
+      if (endIdx <= ci + 1) continue;
+      std::size_t bodyIdx = ci + 1;
+      for (std::size_t j = ci + 1; j < endIdx; ++j) {
+        if (fn.instructions[j].op == Op::Label &&
+            fn.instructions[j].label.find("_while_body_") != std::string::npos) {
+          bodyIdx = j; break;
+        }
+      }
+      if (bodyIdx <= ci) continue;
+      const std::size_t bodyStart = bodyIdx + 1;
+      const std::size_t bodyEnd = endIdx;
+
+      std::unordered_map<int, int> defCount;
+      bool anyStoreGlobal = false;
+      for (std::size_t j = bodyStart; j < bodyEnd; ++j) {
+        const auto &ins = fn.instructions[j];
+        if (ins.op == Op::StoreGlobal) anyStoreGlobal = true;
+        if (definesSlot(ins) && ins.dest != -1) ++defCount[ins.dest];
+      }
+      std::unordered_set<int> invariant;
+      auto isInvariantSlot = [&](int s) {
+        auto it = defCount.find(s);
+        return it == defCount.end() || it->second == 0 || invariant.count(s);
+      };
+
+      std::vector<bool> hoist(fn.instructions.size(), false);
+      bool sawCall = false;
+      for (std::size_t j = bodyStart; j < bodyEnd; ++j) {
+        const auto &ins = fn.instructions[j];
+        if (ins.op == Op::Call) { sawCall = true; continue; }
+        if (!definesSlot(ins) || ins.dest == -1) continue;
+        if (sawCall) continue;
+        if (defCount[ins.dest] != 1) continue;
+        if (ins.op == Op::LoadGlobal && anyStoreGlobal) continue;
+        bool ok = true;
+        for (int s : readsOf(ins))
+          if (!isInvariantSlot(s)) { ok = false; break; }
+        if (!ok) continue;
+        hoist[j] = true;
+        defCount[ins.dest] = 0;
+        invariant.insert(ins.dest);
+      }
+
+      bool hoistedAny = false;
+      for (std::size_t j = bodyStart; j < bodyEnd; ++j)
+        if (hoist[j]) { hoistedAny = true; break; }
+      if (!hoistedAny) continue;
+
+      std::vector<Inst> out;
+      out.reserve(fn.instructions.size());
+      for (std::size_t j = 0; j < ci; ++j) out.push_back(fn.instructions[j]);
+      for (std::size_t j = bodyStart; j < bodyEnd; ++j)
+        if (hoist[j]) out.push_back(fn.instructions[j]);
+      for (std::size_t j = ci; j < bodyStart; ++j) out.push_back(fn.instructions[j]);
+      for (std::size_t j = bodyStart; j < bodyEnd; ++j)
+        if (!hoist[j]) out.push_back(fn.instructions[j]);
+      for (std::size_t j = bodyEnd; j < fn.instructions.size(); ++j) out.push_back(fn.instructions[j]);
+      fn.instructions = std::move(out);
+      changed = true;
+      any = true;
+      break;
+    }
+  }
+  return any;
+}
+
 void optimizeFunction(ir::Function &fn) {
   for (int iter = 0; iter < 16; ++iter) {
     bool any = false;
@@ -455,6 +575,7 @@ void optimizeFunction(ir::Function &fn) {
     any |= copyPropPass(fn);
     any |= csePass(fn);
     any |= copyCoalescePass(fn);
+    any |= licmPass(fn);
     any |= dcePass(fn);
     if (!any) break;
   }
