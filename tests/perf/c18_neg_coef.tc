@@ -1,0 +1,6 @@
+// s += i * (-3) via i*3 then subtract
+int main() {
+  int s = 50000; int i = 0;
+  while (i < 200) { int t = i * 3; s = s - t; i = i + 1; }
+  return s % 256;
+}

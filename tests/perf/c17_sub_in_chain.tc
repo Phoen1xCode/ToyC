@@ -1,0 +1,6 @@
+// mixed add/sub in reduction chain: s += (i+5) - (i*2)  = s -= i - 5
+int main() {
+  int s = 1000; int i = 0;
+  while (i < 100) { int a = i + 5; int b = i * 2; s = s + a; s = s - b; i = i + 1; }
+  return s % 256;
+}
