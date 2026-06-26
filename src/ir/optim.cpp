@@ -3,6 +3,7 @@
 #include "ir/cfg.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <queue>
 #include <unordered_map>
@@ -845,7 +846,363 @@ bool licmPass(ir::Function &fn,
 }
 
 // ---------------------------------------------------------------------------
-// Instruction combining: collapse chained constant self-add/sub on the same
+// Loop summation elimination (closed-form induction-accumulator folding).
+//
+// Detects the canonical pattern
+//     s = s_init;  i = i_init;
+//     while (i < N) {            // or <=, >, >=
+//         s = s + addend;         // addend affine in i:  a*i + c  (a,c const)
+//         i = i + step;           // step nonzero const (typically 1)
+//     }
+// and replaces the whole loop with the closed-form
+//     s = s_init + Σ_{k=0..T-1} (a*(i_init + k*step) + c)
+//       = s_init + T*(a*i_init + c) + a*step*T*(T-1)/2
+// where T is the compile-time trip count. This is the optimization gcc -O2
+// uses to turn `for(i=0;i<N;i++) s+=c; return s%256;` into `return const;` —
+// without it our O(N) loop runs 30-100× longer than gcc's O(1) code on real
+// hardware, which is the root cause of p07 (3%) / p08 (1%) / p02 (9%).
+//
+// Soundness:
+//  - ToyC `int` is 32-bit signed; test programs have no UB, so the iterative
+//    sum never overflows 32-bit. Computing the closed form in int64 and
+//    truncating to int32 therefore matches exactly.
+//  - Guard: if T < 0, T > 3e9, or any int64 intermediate overflows → skip.
+//  - The body must be exactly {optional addend-temp Binary, accumulator
+//    Binary, induction Binary} — no Call/StoreGlobal/Branch/Goto/internal
+//    Label. This rejects loops with if/break/continue/nested loops (p09,
+//    lv7/lv8 functional tests) so they keep their original code.
+//  - `s` must not be read in the body except as its own update lhs. `i` and
+//    `s` each defined exactly once in the body.
+//  - `i_init`, `step`, `N` must all resolve to compile-time constants.
+//  - `s_init` must resolve to a compile-time constant (else skip — the common
+//    perf cases all init `s = 0`).
+//  - Zero-trip loops (i_init already past N) → T=0, s stays s_init, i stays
+//    i_init; we still emit the (trivial) Consts and delete the loop.
+// ---------------------------------------------------------------------------
+namespace {
+// Backward scan for the most recent def of `slot` before `beforeIdx` that is
+// either a Const (returns its value) or a Move from a slot that itself resolves
+// to a Const (one level of indirection). Returns {found, value}.
+struct ConstRes { bool ok; long long v; };
+ConstRes resolveInitConst(const ir::Function &fn, int slot, std::size_t beforeIdx) {
+  for (std::size_t j = beforeIdx; j-- > 0;) {
+    const auto &ins = fn.instructions[j];
+    if (ins.dest != slot) continue;
+    if (ins.op == Op::Const) return {true, ins.value};
+    if (ins.op == Op::Move) {
+      // one level of Move-from-Const
+      for (std::size_t k = j; k-- > 0;) {
+        const auto &m = fn.instructions[k];
+        if (m.dest != ins.lhs) continue;
+        if (m.op == Op::Const) return {true, m.value};
+        break;
+      }
+    }
+    return {false, 0};  // some other def kind, give up
+  }
+  return {false, 0};
+}
+
+// ceil(a/b) for b>0, a any integer. Returns 0 when a<=0.
+long long ceilDivPos(long long a, long long b) {
+  if (a <= 0) return 0;
+  return (a + b - 1) / b;
+}
+}  // namespace
+
+bool loopSumElimPass(ir::Function &fn) {
+  bool any = false;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+
+    // Single-def Const slots → known constant values (function-wide).
+    std::unordered_map<int, int> defCount;
+    std::unordered_map<int, long long> constVal;
+    for (const auto &ins : fn.instructions) {
+      if (definesSlot(ins) && ins.dest != -1) {
+        ++defCount[ins.dest];
+        if (ins.op == Op::Const) constVal[ins.dest] = ins.value;
+        else constVal.erase(ins.dest);
+      }
+    }
+    std::unordered_map<int, long long> globalConst;
+    for (const auto &kv : defCount)
+      if (kv.second == 1) {
+        auto it = constVal.find(kv.first);
+        if (it != constVal.end()) globalConst[kv.first] = it->second;
+      }
+    auto constOf = [&](int slot) -> ConstRes {
+      auto it = globalConst.find(slot);
+      if (it != globalConst.end()) return {true, it->second};
+      return {false, 0};
+    };
+
+    // tryElim: attempt to close-form the loop whose `_while_cond_` label is at
+    // `ci`. Returns true and mutates `fn` (replacing the loop with Consts) on
+    // success; returns false (no change) on any rejection.
+    auto tryElim = [&](std::size_t ci) -> bool {
+      // Find matching _while_end_ with nesting (same logic as licmPass).
+      std::size_t endIdx = std::size_t(-1);
+      int nesting = 0;
+      for (std::size_t j = ci + 1; j < fn.instructions.size(); ++j) {
+        const auto &x = fn.instructions[j];
+        if (x.op != Op::Label) continue;
+        const std::string &lbl = x.label;
+        if (lbl.find("_while_cond_") != std::string::npos) ++nesting;
+        else if (lbl.find("_while_end_") != std::string::npos) {
+          if (nesting == 0) { endIdx = j; break; }
+          --nesting;
+        }
+      }
+      if (endIdx == std::size_t(-1)) return false;
+      std::size_t bodyIdx = std::size_t(-1);
+      for (std::size_t j = ci + 1; j < endIdx; ++j) {
+        if (fn.instructions[j].op == Op::Label &&
+            fn.instructions[j].label.find("_while_body_") != std::string::npos) {
+          bodyIdx = j; break;
+        }
+      }
+      if (bodyIdx == std::size_t(-1)) return false;
+      const std::size_t condStart = ci + 1;
+      const std::size_t bodyStart = bodyIdx + 1;
+      const std::size_t bodyEnd = endIdx;
+
+      // ---- Parse cond block [condStart, bodyIdx): Const bound?, Binary cmp,
+      // Branch. The Branch's lhs is the cmp result slot. ----
+      std::size_t branchIdx = std::size_t(-1);
+      for (std::size_t j = condStart; j < bodyIdx; ++j)
+        if (fn.instructions[j].op == Op::Branch) { branchIdx = j; break; }
+      if (branchIdx == std::size_t(-1)) return false;
+      const int cmpSlot = fn.instructions[branchIdx].lhs;
+      if (cmpSlot == -1) return false;
+      std::size_t cmpIdx = std::size_t(-1);
+      for (std::size_t j = condStart; j < branchIdx; ++j) {
+        if (fn.instructions[j].op == Op::Binary && fn.instructions[j].dest == cmpSlot) {
+          cmpIdx = j; break;
+        }
+      }
+      if (cmpIdx == std::size_t(-1)) return false;
+      const auto &cmpIns = fn.instructions[cmpIdx];
+      using BOP = ir::BinaryOp;
+      const BOP cmpOp = cmpIns.binary;
+
+      // ---- Parse body [bodyStart, bodyEnd): collect non-Label insts. ----
+      // The trailing back-edge `Goto _while_cond_` is part of the loop
+      // structure, not body control flow — skip it rather than rejecting.
+      const std::string &condLabel = fn.instructions[ci].label;
+      std::vector<std::size_t> bodyInsts;
+      for (std::size_t j = bodyStart; j < bodyEnd; ++j) {
+        const auto &b = fn.instructions[j];
+        if (b.op == Op::Label) continue;
+        if (b.op == Op::Goto && b.label == condLabel) continue;  // back-edge
+        if (b.op == Op::Goto || b.op == Op::Branch || b.op == Op::Return ||
+            b.op == Op::ReturnVoid || b.op == Op::Call || b.op == Op::StoreGlobal)
+          return false;  // body has control flow / side effects → reject
+        bodyInsts.push_back(j);
+      }
+      if (bodyInsts.empty() || bodyInsts.size() > 3) return false;
+
+      // Identify the two self-add/sub instructions in the body. The induction
+      // variable is the one whose slot appears as an operand of the comparison
+      // Binary; the other is the accumulator. (Distinguishing by "rhs is a
+      // nonzero const" is wrong — `acc += 162` also has a const-nonzero rhs.)
+      int iSlot = -1;
+      long long step = 0;
+      std::size_t indIdx = std::size_t(-1);
+      int accSlot = -1;
+      long long accSign = 0;  // +1 for Add, -1 for Sub
+      int addendSlot = -1;
+      std::size_t accIdx = std::size_t(-1);
+      for (std::size_t bi : bodyInsts) {
+        const auto &b = fn.instructions[bi];
+        if (b.op != Op::Binary) continue;
+        if (b.dest != b.lhs || b.dest == -1) continue;
+        if (b.binary != BOP::Add && b.binary != BOP::Sub) continue;
+        // Is this slot the induction var (appears in the comparison)?
+        if (b.dest == cmpIns.lhs || b.dest == cmpIns.rhs) {
+          if (iSlot != -1) return false;  // two induction vars — reject
+          auto r = constOf(b.rhs);
+          if (!r.ok || r.v == 0) return false;  // step must be const nonzero
+          iSlot = b.dest;
+          step = (b.binary == BOP::Sub) ? -r.v : r.v;
+          indIdx = bi;
+        } else {
+          if (accSlot != -1) return false;  // two accumulators — reject
+          accSlot = b.dest;
+          accSign = (b.binary == BOP::Sub) ? -1 : 1;
+          addendSlot = b.rhs;
+          accIdx = bi;
+        }
+      }
+      if (iSlot == -1 || accSlot == -1) return false;
+      if (accSlot == iSlot) return false;
+
+      // Optional addend temp: a Binary defined in body, dest == addendSlot,
+      // used only by the accumulator. Body may contain at most one such extra.
+      std::size_t addendTempIdx = std::size_t(-1);
+      for (std::size_t bi : bodyInsts) {
+        if (bi == indIdx || bi == accIdx) continue;
+        const auto &b = fn.instructions[bi];
+        if (b.op != Op::Binary || b.dest != addendSlot) return false;
+        addendTempIdx = bi;
+      }
+
+      // Resolve affine (a, c) for the addend.
+      long long aCoef = 0, cConst = 0;
+      bool affineOk = false;
+      if (addendSlot == iSlot) {
+        aCoef = 1; cConst = 0; affineOk = true;
+      } else {
+        auto cr = constOf(addendSlot);
+        if (cr.ok) { aCoef = 0; cConst = cr.v; affineOk = true; }
+      }
+      if (!affineOk && addendTempIdx != std::size_t(-1)) {
+        const auto &t = fn.instructions[addendTempIdx];
+        bool lIsI = (t.lhs == iSlot), rIsI = (t.rhs == iSlot);
+        if (!lIsI && !rIsI) return false;
+        int otherSlot = lIsI ? t.rhs : t.lhs;
+        auto oc = constOf(otherSlot);
+        if (!oc.ok) return false;
+        long long K = oc.v;
+        if (t.binary == BOP::Add) { aCoef = 1; cConst = K; affineOk = true; }
+        else if (t.binary == BOP::Sub && lIsI) { aCoef = 1; cConst = -K; affineOk = true; }
+        else if (t.binary == BOP::Mul) { aCoef = K; cConst = 0; affineOk = true; }
+        else return false;
+        const auto uses = computeUseCount(fn);
+        int tUses = uses.count(addendSlot) ? uses.at(addendSlot) : 0;
+        if (tUses != 1) return false;
+      }
+      if (!affineOk) return false;
+      aCoef *= accSign;
+      cConst *= accSign;
+
+      // ---- Resolve i_init, N, s_init as constants; normalize cmp to "i OP bound". ----
+      int boundSlot = -1;
+      BOP normOp;
+      if (cmpIns.lhs == iSlot) { boundSlot = cmpIns.rhs; normOp = cmpOp; }
+      else if (cmpIns.rhs == iSlot) {
+        boundSlot = cmpIns.lhs;
+        switch (cmpOp) {
+          case BOP::Less: normOp = BOP::Greater; break;
+          case BOP::LessEqual: normOp = BOP::GreaterEqual; break;
+          case BOP::Greater: normOp = BOP::Less; break;
+          case BOP::GreaterEqual: normOp = BOP::LessEqual; break;
+          default: return false;
+        }
+      } else {
+        return false;
+      }
+      if (boundSlot == -1) return false;
+      auto boundRes = constOf(boundSlot);
+      if (!boundRes.ok) return false;
+      long long N = boundRes.v;
+      auto initRes = resolveInitConst(fn, iSlot, ci);
+      if (!initRes.ok) return false;
+      long long iInit = initRes.v;
+      // Note: we do NOT require s_init to be a known constant — the additive
+      // form `s = s + sum` emitted below is sound regardless of s's entry
+      // value (which matters for nested loops where s carries over).
+
+      // ---- Trip count T. ----
+      long long T = -1;
+      if (step > 0) {
+        if (normOp == BOP::Less) T = ceilDivPos(N - iInit, step);
+        else if (normOp == BOP::LessEqual) {
+          if (N < iInit) T = 0;
+          else T = (N - iInit) / step + 1;
+        } else return false;
+      } else if (step < 0) {
+        long long ns = -step;
+        if (normOp == BOP::Greater) T = ceilDivPos(iInit - N, ns);
+        else if (normOp == BOP::GreaterEqual) {
+          if (iInit < N) T = 0;
+          else T = (iInit - N) / ns + 1;
+        } else return false;
+      } else {
+        return false;
+      }
+      if (T < 0) return false;
+      if (T > 3000000000LL) return false;  // int64-overflow guard
+
+      // ---- Closed-form sum in int64, with overflow checks. ----
+      // sum = Σ_{k=0..T-1} (a*(iInit + k*step) + c)
+      //     = T*(a*iInit + c) + a*step*T*(T-1)/2
+      // We emit the ADDITIVE form `s = s + sum` (not `s = s_init + sum`),
+      // which is sound whether the loop runs once, is nested inside another
+      // loop (s carries over between outer iterations), or runs sequentially
+      // after prior updates. constFold/globalConstProp later fold it to a
+      // single Const when s_init is a known constant.
+      auto safeMul = [](long long x, long long y, bool &ok) -> long long {
+        if (!ok) return 0;
+        if (x == 0 || y == 0) return 0;
+        if (x > 0) {
+          if (y > 0 ? x > (LLONG_MAX / y) : y < (LLONG_MIN / x)) { ok = false; return 0; }
+        } else {
+          if (y > 0 ? x < (LLONG_MIN / y) : y < (LLONG_MAX / x)) { ok = false; return 0; }
+        }
+        return x * y;
+      };
+      bool ok = true;
+      long long aI = safeMul(aCoef, iInit, ok);
+      long long base = aI + cConst;
+      if (ok && ((aI > 0 && cConst > 0 && base < aI) ||
+                 (aI < 0 && cConst < 0 && base > aI))) ok = false;
+      long long term1 = safeMul(T, base, ok);
+      long long Tm1 = T - 1;
+      long long tri = safeMul(T, Tm1, ok);  // T*(T-1), always even
+      bool triNeg = tri < 0;
+      tri = triNeg ? -tri : tri;
+      tri /= 2;
+      if (triNeg) tri = -tri;
+      long long astep = safeMul(aCoef, step, ok);
+      long long term2 = safeMul(astep, tri, ok);
+      if (!ok) return false;
+      long long sum = term1 + term2;
+      if ((term1 > 0 && term2 > 0 && sum < term1) ||
+          (term1 < 0 && term2 < 0 && sum > term1)) return false;
+      long long iFinalLL = iInit + safeMul(T, step, ok);
+      if (!ok) return false;
+
+      // trunc32 matches two's-complement wraparound (no-op when no overflow,
+      // which is the guaranteed case for no-UB programs; correct otherwise
+      // because 32-bit addition is associative mod 2^32).
+      auto trunc32 = [](long long x) -> int {
+        return static_cast<int>(static_cast<std::uint32_t>(x));
+      };
+      int sum32 = trunc32(sum);
+      int iFinal32 = trunc32(iFinalLL);
+
+      // ---- Rewrite: replace [ci, endIdx) with:
+      //   Const sum → newTmp; Binary s = s Add newTmp; Const i_final → i
+      // The additive `s = s + sum` is sound for nested/sequential loops.
+      // constFold collapses it to a single Const when s_init is known. ----
+      const int newTmp = fn.slotCount++;
+      std::vector<Inst> out;
+      out.reserve(fn.instructions.size() - (endIdx - ci) + 6);
+      for (std::size_t j = 0; j < ci; ++j) out.push_back(fn.instructions[j]);
+      Inst sc; sc.op = Op::Const; sc.dest = newTmp; sc.value = sum32;
+      out.push_back(sc);
+      Inst add; add.op = Op::Binary; add.dest = accSlot; add.lhs = accSlot;
+      add.rhs = newTmp; add.binary = ir::BinaryOp::Add;
+      out.push_back(add);
+      Inst ic; ic.op = Op::Const; ic.dest = iSlot; ic.value = iFinal32;
+      out.push_back(ic);
+      for (std::size_t j = endIdx; j < fn.instructions.size(); ++j)
+        out.push_back(fn.instructions[j]);
+      fn.instructions = std::move(out);
+      return true;
+    };
+
+    for (std::size_t ci = 0; ci < fn.instructions.size(); ++ci) {
+      if (fn.instructions[ci].op != Op::Label) continue;
+      if (fn.instructions[ci].label.find("_while_cond_") == std::string::npos) continue;
+      if (tryElim(ci)) { changed = true; any = true; break; }
+    }
+  }
+  return any;
+}
+
 // slot. After copyCoalesce, `input = input + 1; input = input + 1; ...` looks
 // like a run of `Binary input = input Add constSlot` where constSlot is a
 // single-def Const. We merge a run into one `Binary input = input Add (sum)`
@@ -1741,6 +2098,7 @@ void optimizeFunction(ir::Function &fn,
     any |= copyCoalescePass(fn);
     any |= instCombinePass(fn);
     any |= licmPass(fn, pureFunctions);
+    any |= loopSumElimPass(fn);
     any |= dcePass(fn);
     if (getenv("TOYCC_DUMP_IR")) {
       fprintf(stderr, "=== %s after iter %d ===\n", fn.name.c_str(), iter);

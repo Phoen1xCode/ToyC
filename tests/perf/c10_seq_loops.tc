@@ -1,0 +1,9 @@
+// Two sequential loops accumulating into same s
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 100) { s = s + 5; i = i + 1; }
+  i = 0;
+  while (i < 200) { s = s + i; i = i + 1; }
+  return s % 256;
+}

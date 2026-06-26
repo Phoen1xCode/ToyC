@@ -1,0 +1,7 @@
+// addend = i * K  (affine with a=K)
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 1000) { int t = i * 3; s = s + t; i = i + 1; }
+  return s % 256;
+}

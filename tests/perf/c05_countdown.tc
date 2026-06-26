@@ -1,0 +1,7 @@
+// countdown: i > N, step -1
+int main() {
+  int s = 0;
+  int i = 1000;
+  while (i > 0) { s = s + i; i = i - 1; }
+  return s % 256;
+}

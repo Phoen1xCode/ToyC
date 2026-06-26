@@ -1,0 +1,11 @@
+// break inside — must NOT be eliminated (pattern rejected)
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 1000) {
+    s = s + i;
+    if (s > 1000) break;
+    i = i + 1;
+  }
+  return s % 256;
+}

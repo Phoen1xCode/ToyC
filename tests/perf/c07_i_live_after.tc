@@ -1,0 +1,7 @@
+// i is read after the loop — i_final must be correct
+int main() {
+  int s = 0;
+  int i = 0;
+  while (i < 500) { s = s + 2; i = i + 1; }
+  return (s + i) % 256;
+}

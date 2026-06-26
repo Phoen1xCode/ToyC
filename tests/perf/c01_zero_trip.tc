@@ -1,0 +1,7 @@
+// Zero-trip loop: i starts at/above bound. s must stay s_init, loop deleted.
+int main() {
+  int s = 0;
+  int i = 100;
+  while (i < 50) { s = s + 7; i = i + 1; }
+  return s % 256;
+}
