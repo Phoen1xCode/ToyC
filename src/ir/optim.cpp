@@ -1001,81 +1001,145 @@ bool loopSumElimPass(ir::Function &fn) {
           return false;  // body has control flow / side effects → reject
         bodyInsts.push_back(j);
       }
-      if (bodyInsts.empty() || bodyInsts.size() > 3) return false;
+      if (bodyInsts.empty() || bodyInsts.size() > 8) return false;
 
-      // Identify the two self-add/sub instructions in the body. The induction
-      // variable is the one whose slot appears as an operand of the comparison
-      // Binary; the other is the accumulator. (Distinguishing by "rhs is a
-      // nonzero const" is wrong — `acc += 162` also has a const-nonzero rhs.)
+      // Identify the induction update: self-add/sub `i = i +/- step` where dest
+      // appears in the comparison. ( rhs must be a const nonzero. )
       int iSlot = -1;
       long long step = 0;
       std::size_t indIdx = std::size_t(-1);
-      int accSlot = -1;
-      long long accSign = 0;  // +1 for Add, -1 for Sub
-      int addendSlot = -1;
-      std::size_t accIdx = std::size_t(-1);
       for (std::size_t bi : bodyInsts) {
         const auto &b = fn.instructions[bi];
         if (b.op != Op::Binary) continue;
         if (b.dest != b.lhs || b.dest == -1) continue;
         if (b.binary != BOP::Add && b.binary != BOP::Sub) continue;
-        // Is this slot the induction var (appears in the comparison)?
         if (b.dest == cmpIns.lhs || b.dest == cmpIns.rhs) {
-          if (iSlot != -1) return false;  // two induction vars — reject
+          if (iSlot != -1) return false;  // two induction vars
           auto r = constOf(b.rhs);
-          if (!r.ok || r.v == 0) return false;  // step must be const nonzero
+          if (!r.ok || r.v == 0) return false;
           iSlot = b.dest;
           step = (b.binary == BOP::Sub) ? -r.v : r.v;
           indIdx = bi;
-        } else {
-          if (accSlot != -1) return false;  // two accumulators — reject
-          accSlot = b.dest;
-          accSign = (b.binary == BOP::Sub) ? -1 : 1;
-          addendSlot = b.rhs;
-          accIdx = bi;
         }
       }
-      if (iSlot == -1 || accSlot == -1) return false;
-      if (accSlot == iSlot) return false;
+      if (iSlot == -1) return false;
 
-      // Optional addend temp: a Binary defined in body, dest == addendSlot,
-      // used only by the accumulator. Body may contain at most one such extra.
-      std::size_t addendTempIdx = std::size_t(-1);
+      // Identify the accumulator `s`: the slot written in the body (excl. i)
+      // that is read AFTER the loop (live-out). Chain temps are single-use
+      // within the body and dead after, so the live-out slot is `s`. Require
+      // exactly one.
+      std::unordered_set<int> bodyWritten;
       for (std::size_t bi : bodyInsts) {
-        if (bi == indIdx || bi == accIdx) continue;
         const auto &b = fn.instructions[bi];
-        if (b.op != Op::Binary || b.dest != addendSlot) return false;
-        addendTempIdx = bi;
+        if (b.op == Op::Binary && b.dest != -1 && b.dest != iSlot)
+          bodyWritten.insert(b.dest);
       }
+      std::unordered_set<int> liveOut;
+      for (std::size_t j = endIdx + 1; j < fn.instructions.size(); ++j)
+        for (int s : readsOf(fn.instructions[j])) liveOut.insert(s);
+      int accSlot = -1;
+      for (int w : bodyWritten) {
+        if (liveOut.count(w)) {
+          if (accSlot != -1) return false;  // ambiguous accumulator
+          accSlot = w;
+        }
+      }
+      if (accSlot == -1) return false;  // no live-out accumulator → leave to DCE
 
-      // Resolve affine (a, c) for the addend.
-      long long aCoef = 0, cConst = 0;
-      bool affineOk = false;
-      if (addendSlot == iSlot) {
-        aCoef = 1; cConst = 0; affineOk = true;
-      } else {
-        auto cr = constOf(addendSlot);
-        if (cr.ok) { aCoef = 0; cConst = cr.v; affineOk = true; }
+      // The Binary that writes back to accSlot (the chain tail).
+      std::size_t accWriteIdx = std::size_t(-1);
+      for (std::size_t bi : bodyInsts) {
+        if (fn.instructions[bi].dest == accSlot) {
+          if (accWriteIdx != std::size_t(-1)) return false;  // written twice
+          accWriteIdx = bi;
+        }
       }
-      if (!affineOk && addendTempIdx != std::size_t(-1)) {
-        const auto &t = fn.instructions[addendTempIdx];
+      if (accWriteIdx == std::size_t(-1)) return false;
+
+      // Helper: find the body Binary index that defines `slot` (single def in body).
+      auto findBodyDef = [&](int slot) -> std::size_t {
+        std::size_t found = std::size_t(-1);
+        for (std::size_t bi : bodyInsts) {
+          if (fn.instructions[bi].dest == slot) {
+            if (found != std::size_t(-1)) return std::size_t(-1);  // ambiguous
+            found = bi;
+          }
+        }
+        return found;
+      };
+      // Helper: resolve a term slot to affine (a, c). A term may be:
+      //  - iSlot itself → (1, 0)
+      //  - a single-def Const slot → (0, const)
+      //  - a single-use body temp Binary `t = i +/- K` or `i * K` (K const)
+      auto resolveTerm = [&](int slot, long long &a, long long &c) -> bool {
+        if (slot == iSlot) { a = 1; c = 0; return true; }
+        auto cr = constOf(slot);
+        if (cr.ok) { a = 0; c = cr.v; return true; }
+        std::size_t tIdx = findBodyDef(slot);
+        if (tIdx == std::size_t(-1)) return false;
+        const auto &t = fn.instructions[tIdx];
+        if (t.op != Op::Binary) return false;
         bool lIsI = (t.lhs == iSlot), rIsI = (t.rhs == iSlot);
         if (!lIsI && !rIsI) return false;
         int otherSlot = lIsI ? t.rhs : t.lhs;
         auto oc = constOf(otherSlot);
         if (!oc.ok) return false;
         long long K = oc.v;
-        if (t.binary == BOP::Add) { aCoef = 1; cConst = K; affineOk = true; }
-        else if (t.binary == BOP::Sub && lIsI) { aCoef = 1; cConst = -K; affineOk = true; }
-        else if (t.binary == BOP::Mul) { aCoef = K; cConst = 0; affineOk = true; }
+        if (t.binary == BOP::Add) { a = 1; c = K; }
+        else if (t.binary == BOP::Sub && lIsI) { a = 1; c = -K; }
+        else if (t.binary == BOP::Mul) { a = K; c = 0; }
         else return false;
+        // Term temp must be single-use (only the chain reads it).
         const auto uses = computeUseCount(fn);
-        int tUses = uses.count(addendSlot) ? uses.at(addendSlot) : 0;
+        int tUses = uses.count(slot) ? uses.at(slot) : 0;
         if (tUses != 1) return false;
+        return true;
+      };
+
+      // Trace the reduction chain backward from accWriteIdx. Each step is
+      // `link = prevLink +/- term`. The link operand is accSlot or a body
+      // temp defined as `prevLink +/- term`; the term operand is an affine
+      // leaf in i (i, const, or `i +/- K` temp) — i.e. resolveTerm succeeds.
+      // Stop when prevLink == accSlot (the live-in read).
+      long long aCoef = 0, cConst = 0;
+      std::size_t cur = accWriteIdx;
+      int linkSlot = -1;
+      std::unordered_set<int> visited;
+      for (int iter = 0; iter < 16; ++iter) {  // bound chain length
+        if (visited.count(static_cast<int>(cur))) return false;
+        visited.insert(static_cast<int>(cur));
+        const auto &b = fn.instructions[cur];
+        if (b.op != Op::Binary || (b.binary != BOP::Add && b.binary != BOP::Sub))
+          return false;
+        // Classify operands: a "term" resolves to affine-in-i; the other is
+        // the link (accSlot or a body-defined chain temp). accSlot is never a
+        // term (it's the accumulator).
+        long long la = 0, lc = 0, ra = 0, rc = 0;
+        bool lhsTerm = (b.lhs != accSlot) && resolveTerm(b.lhs, la, lc);
+        bool rhsTerm = (b.rhs != accSlot) && resolveTerm(b.rhs, ra, rc);
+        if (lhsTerm && rhsTerm) return false;  // both terms, no link
+        if (!lhsTerm && !rhsTerm) return false;  // no term
+        int termSlot, nextLink; long long ta, tc, sign;
+        if (lhsTerm) {
+          // form: term op link. Add → +term; Sub → term - link (negates chain) → reject
+          if (b.binary == BOP::Sub) return false;
+          termSlot = b.lhs; nextLink = b.rhs; ta = la; tc = lc; sign = 1;
+        } else {
+          // form: link op term. Add → +term; Sub → -term
+          termSlot = b.rhs; nextLink = b.lhs; ta = ra; tc = rc;
+          sign = (b.binary == BOP::Sub) ? -1 : 1;
+        }
+        (void)termSlot;
+        aCoef += sign * ta;
+        cConst += sign * tc;
+        if (nextLink == accSlot) { linkSlot = nextLink; break; }  // chain end
+        std::size_t nextDef = findBodyDef(nextLink);
+        if (nextDef == std::size_t(-1)) return false;  // link not body-defined
+        cur = nextDef;
+        linkSlot = nextLink;
       }
-      if (!affineOk) return false;
-      aCoef *= accSign;
-      cConst *= accSign;
+      if (linkSlot != accSlot) return false;  // chain didn't reach the live-in read
+      (void)indIdx;
 
       // ---- Resolve i_init, N, s_init as constants; normalize cmp to "i OP bound". ----
       int boundSlot = -1;
