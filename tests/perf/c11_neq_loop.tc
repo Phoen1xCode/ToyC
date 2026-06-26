@@ -1,0 +1,6 @@
+int main() {
+  int s = 0;
+  int n = 5000;
+  while (n != 0) { s = s + n; n = n - 1; }
+  return s % 256;
+}

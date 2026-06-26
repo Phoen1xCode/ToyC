@@ -1152,7 +1152,8 @@ bool loopSumElimPass(ir::Function &fn) {
           case BOP::LessEqual: normOp = BOP::GreaterEqual; break;
           case BOP::Greater: normOp = BOP::Less; break;
           case BOP::GreaterEqual: normOp = BOP::LessEqual; break;
-          default: return false;
+          case BOP::NotEqual: normOp = BOP::NotEqual; break;  // symmetric
+          default: return false;  // Equal is not a loop condition we handle
         }
       } else {
         return false;
@@ -1170,7 +1171,19 @@ bool loopSumElimPass(ir::Function &fn) {
 
       // ---- Trip count T. ----
       long long T = -1;
-      if (step > 0) {
+      if (normOp == BOP::NotEqual) {
+        // `while (i != N)`: runs until i hits N. Zero trips if iInit == N.
+        // Otherwise requires step to move i exactly toward N (same sign) and
+        // (N - iInit) divisible by step, else the loop is infinite → reject.
+        long long diff = N - iInit;
+        if (diff == 0) T = 0;
+        else {
+          if ((diff > 0) != (step > 0)) return false;  // moving away → infinite
+          if (diff % step != 0) return false;           // never hits N exactly
+          T = diff / step;
+          if (T <= 0) return false;
+        }
+      } else if (step > 0) {
         if (normOp == BOP::Less) T = ceilDivPos(N - iInit, step);
         else if (normOp == BOP::LessEqual) {
           if (N < iInit) T = 0;
