@@ -1365,6 +1365,21 @@ bool instCombinePass(ir::Function &fn) {
         ins.binary == ir::BinaryOp::Add || ins.binary == ir::BinaryOp::Sub;
 
     // Chain extension: Binary t = chainTip +/- c  → bump first Const, rewrite to Move.
+    //
+    // Soundness: bumping `chainConstIdx`'s Const changes the value the
+    // chain-start Binary computes, which propagates to EVERY reader of the
+    // chain tip — not just the next chain link. If an external reader (e.g.,
+    // a `Move i = a` produced by copyProp/CSE aliasing the induction
+    // `i = i + 1` to the chain start `a = i + 1`) reads the tip, bumping
+    // corrupts that reader. So we may only extend while the current tip is
+    // read by exactly this extending Binary (uses == 1). The final tip's
+    // single reader is the accumulator feed (`s = s + tip`), which is the
+    // intended consumer — that's fine. Any extra reader breaks the chain.
+    if (ins.op == Op::Binary && chainTip != -1 && ins.lhs == chainTip &&
+        ins.dest != -1 && ins.dest != chainTip && ins.rhs != -1 && isAddSub) {
+      const int tipUses = uses.count(chainTip) ? uses.at(chainTip) : 0;
+      if (tipUses != 1) { chainTip = -1; }  // external reader → chain unsound
+    }
     if (ins.op == Op::Binary && chainTip != -1 && ins.lhs == chainTip &&
         ins.dest != -1 && ins.dest != chainTip && ins.rhs != -1 && isAddSub) {
       // Look up rhs as a const: prefer per-BB knownConst (handles locals that
@@ -2164,19 +2179,30 @@ void optimizeFunction(ir::Function &fn,
   globalConstPropPass(fn);
   globalCopyPropPass(fn);
   globalCsePass(fn);
+  auto dumpPass = [&](const char *name) {
+    if (!getenv("TOYCC_DUMP_PASS")) return;
+    fprintf(stderr, "--- %s : %s ---\n", fn.name.c_str(), name);
+    for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
+      const auto &ins = fn.instructions[i];
+      fprintf(stderr, "  [%zu] op=%d dest=%d lhs=%d rhs=%d v=%d bin=%d lab=%s\n",
+          i, (int)ins.op, ins.dest, ins.lhs, ins.rhs, ins.value,
+          (int)ins.binary, ins.label.c_str());
+    }
+  };
   for (int iter = 0; iter < 16; ++iter) {
     bool any = false;
-    any |= constFoldPass(fn);
-    any |= branchFoldPass(fn);
-    any |= deadBlockPass(fn);
-    any |= gotoCleanupPass(fn);
-    any |= copyPropPass(fn);
-    any |= csePass(fn);
-    any |= copyCoalescePass(fn);
-    any |= instCombinePass(fn);
-    any |= licmPass(fn, pureFunctions);
-    any |= loopSumElimPass(fn);
-    any |= dcePass(fn);
+    bool changed = false;
+    changed = constFoldPass(fn); any |= changed; dumpPass("constFold");
+    changed = branchFoldPass(fn); any |= changed; dumpPass("branchFold");
+    changed = deadBlockPass(fn); any |= changed; dumpPass("deadBlock");
+    changed = gotoCleanupPass(fn); any |= changed; dumpPass("gotoCleanup");
+    changed = copyPropPass(fn); any |= changed; dumpPass("copyProp");
+    changed = csePass(fn); any |= changed; dumpPass("cse");
+    changed = copyCoalescePass(fn); any |= changed; dumpPass("copyCoalesce");
+    changed = instCombinePass(fn); any |= changed; dumpPass("instCombine");
+    changed = licmPass(fn, pureFunctions); any |= changed; dumpPass("licm");
+    changed = loopSumElimPass(fn); any |= changed; dumpPass("loopSumElim");
+    changed = dcePass(fn); any |= changed; dumpPass("dce");
     if (getenv("TOYCC_DUMP_IR")) {
       fprintf(stderr, "=== %s after iter %d ===\n", fn.name.c_str(), iter);
       for (std::size_t i = 0; i < fn.instructions.size(); ++i) {
