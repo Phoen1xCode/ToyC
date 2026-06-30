@@ -1,0 +1,14 @@
+// p40_poly_multi: polynomial reduction with multiple accumulators
+// s += i*i + 7*i + 5 ; t += 3*i*i - 2*i ; both close-form independently.
+int main() {
+  int s = 0;
+  int t = 0;
+  int i = 0;
+  while (i < 10000) {
+    int sq = i * i;
+    s = s + sq + 7 * i + 5;
+    t = t + 3 * sq - 2 * i;
+    i = i + 1;
+  }
+  return (s + t) % 256;
+}

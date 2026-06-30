@@ -1,0 +1,20 @@
+// p37_powmod: modular exponentiation (res = (res*a) % n in a loop)
+// Migrated from sysy-testsuit-collection/lvX/powmod.c — drops IO, returns %256.
+// Note: mod-in-loop is NOT close-formable (gcc -O2 also runs a scalar loop);
+// this stresses div/rem magic-number codegen.
+int naive_powmod(int a, int b, int n) {
+  int i = 0;
+  int res = 1;
+  while (i < b) {
+    res = (res * a) % n;
+    i = i + 1;
+  }
+  return res;
+}
+int main() {
+  int s = 0;
+  s = s + naive_powmod(2, 5, 3);
+  s = s + naive_powmod(2, 10000, 3);
+  s = s + naive_powmod(2, 1000000, 3);
+  return s % 256;
+}

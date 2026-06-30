@@ -1,0 +1,20 @@
+// p38_try_fold_lhs: constant folding + dead-call elimination
+// Migrated from sysy-testsuit-collection/lvX/try_fold_lhs.c — f() is pure,
+// inlines+folds; the 9 gN() bodies each reduce to a constant.
+int f() { return 233; }
+int g1() { int a = f(); int b = a + 456; int c = b + 123; return c; }
+int g2() { int a = f(); int b = a + 456; int c = b - 123; return c; }
+int g3() { int a = f(); int b = a + 456; int c = 123 - b; return c; }
+int g4() { int a = f(); int b = a - 456; int c = b + 123; return c; }
+int g5() { int a = f(); int b = a - 456; int c = b - 123; return c; }
+int g6() { int a = f(); int b = 456 - a; int c = b + 123; return c; }
+int g7() { int a = f(); int b = 456 - a; int c = b - 123; return c; }
+int g8() { int a = f(); int b = 456 - a; int c = 123 - b; return c; }
+int g9() { int a = f(); int b = a + 456; int c = 123 + b; return c; }
+int main() {
+  int s = 0;
+  s = s + g1(); s = s + g2(); s = s + g3();
+  s = s + g4(); s = s + g5(); s = s + g6();
+  s = s + g7(); s = s + g8(); s = s + g9();
+  return s % 256;
+}

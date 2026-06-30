@@ -1,0 +1,32 @@
+// p39_nested4: 4-deep nested loop, induction-variable combining
+// Migrated from sysy-testsuit-collection/lvX/loop_unroll5.c — single acc,
+// all four induction vars are polynomial; inner loops close-form.
+int test5(int n) {
+  int i = 0;
+  int j = 0;
+  int k = 0;
+  int l = 0;
+  int res = 0;
+  while (i < n) {
+    j = 0;
+    while (j < n) {
+      k = 0;
+      while (k < n) {
+        l = 0;
+        while (l < n) {
+          res = res + i + j + k + l;
+          l = l + 1;
+        }
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return res;
+}
+int main() {
+  int s = 0;
+  s = s + test5(10);
+  return s % 256;
+}
