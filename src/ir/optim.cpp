@@ -908,6 +908,25 @@ long long ceilDivPos(long long a, long long b) {
   if (a <= 0) return 0;
   return (a + b - 1) / b;
 }
+
+// loopSumElimPass helpers. `bad` follows the pass's illFormed convention:
+// bad=true means "overflowed / rejected"; bad=false means "still valid".
+long long safeMulStat(long long x, long long y, bool &bad) {
+  if (bad) return 0;
+  if (x == 0 || y == 0) return 0;
+  if (x > 0) {
+    if (y > 0 ? x > (LLONG_MAX / y) : y < (LLONG_MIN / x)) bad = true;
+  } else {
+    if (y > 0 ? x < (LLONG_MIN / y) : y < (LLONG_MAX / x)) bad = true;
+  }
+  if (bad) return 0;
+  return x * y;
+}
+long long trunc32Stat(long long x, bool &bad) {
+  if (!bad && (x > INT32_MAX || x < INT32_MIN)) bad = true;
+  if (bad) return 0;
+  return static_cast<long long>(static_cast<std::uint32_t>(x));
+}
 }  // namespace
 
 bool loopSumElimPass(ir::Function &fn) {
@@ -1001,7 +1020,7 @@ bool loopSumElimPass(ir::Function &fn) {
           return false;  // body has control flow / side effects → reject
         bodyInsts.push_back(j);
       }
-      if (bodyInsts.empty() || bodyInsts.size() > 8) return false;
+      if (bodyInsts.empty() || bodyInsts.size() > 48) return false;
 
       // Identify the induction update: self-add/sub `i = i +/- step` where dest
       // appears in the comparison. ( rhs must be a const nonzero. )
@@ -1056,89 +1075,95 @@ bool loopSumElimPass(ir::Function &fn) {
       }
       if (accWriteIdx == std::size_t(-1)) return false;
 
-      // Helper: find the body Binary index that defines `slot` (single def in body).
-      auto findBodyDef = [&](int slot) -> std::size_t {
-        std::size_t found = std::size_t(-1);
+      // Helper: find the body Binary/Const index that defines `slot` (single def).
+      // Polynomial in the induction i: qa*i^2 + a*i + c. We evaluate forward
+      // over the body's pure Binary/Const/Move instructions, building a map
+      // slot → Poly for each single-def body temp. This subsumes the old
+      // backward affine-chain heuristic and additionally handles quadratic
+      // reduction bodies like s += i*i, s += (i+1)*(i+1), s += a*i*i + b*i + c.
+      struct Poly { long long qa = 0, a = 0, c = 0; };
+      // Scalar × Poly (K const) → qa*K, a*K, c*K. K≠0.
+      auto mulK = [](const Poly &p, long long K, bool &ok) -> Poly {
+        return {safeMulStat(p.qa, K, ok), safeMulStat(p.a, K, ok),
+                safeMulStat(p.c, K, ok)};
+      };
+      // b*a style for the (L.a)*(R.a) quadratic coefficient, with signed wrap.
+      auto qaMul = [](long long x, long long y, bool &ok) -> long long {
+        return safeMulStat(x, y, ok);
+      };
+      // const × const as int32 product (wrap-safe when both already 32-bit).
+      auto mul32A = [](long long x, long long y, bool &ok) -> long long {
+        return safeMulStat(x, y, ok);
+      };
+      // Wrap a Poly into int32 range (two's complement): no-op if fits.
+      auto wrap32Poly = [](Poly &p, bool &ok) {
+        p.qa = trunc32Stat(p.qa, ok); p.a = trunc32Stat(p.a, ok); p.c = trunc32Stat(p.c, ok);
+      };
+      std::unordered_map<int, Poly> polyOf;   // slot → Poly (body-defined/const/i)
+      polyOf[iSlot] = {0, 1, 0};
+      // Seed constants seen anywhere (function-wide single-def Consts) so a
+      // globalConst référent used by a Mul operand resolves even if the Const
+      // sits above the loop.
+      for (const auto &kv : globalConst) polyOf[kv.first] = {0, 0, kv.second};
+      // Seed the accumulator as the zero polynomial. The body computes
+      // `s = s + term` (an additive reduction); for the reduction we only need
+      // the *increment* per iteration, so s's live-in value is irrelevant —
+      // treat it as 0 and emit `s = s + Σterm` separately at the end.
+      polyOf[accSlot] = {0, 0, 0};
+      bool illFormed = false;
+      auto constOf2 = [&](int s) -> long long* {
+        auto it = polyOf.find(s);
+        if (it == polyOf.end()) return nullptr;
+        return (it->second.qa == 0 && it->second.a == 0) ? &it->second.c : nullptr;
+      };
+      auto evalBody = [&]() {
         for (std::size_t bi : bodyInsts) {
-          if (fn.instructions[bi].dest == slot) {
-            if (found != std::size_t(-1)) return std::size_t(-1);  // ambiguous
-            found = bi;
+          const auto &b = fn.instructions[bi];
+          if (b.op == Op::Const) { polyOf[b.dest] = {0, 0, b.value}; continue; }
+          if (b.op == Op::Move) {
+            auto it = polyOf.find(b.lhs);
+            if (it == polyOf.end()) { illFormed = true; return; }
+            polyOf[b.dest] = it->second; continue;
           }
+          if (b.op != Op::Binary) { illFormed = true; return; }
+          // operands must be known body temps / constants
+          auto li = polyOf.find(b.lhs), ri = polyOf.find(b.rhs);
+          if (li == polyOf.end() || ri == polyOf.end()) { illFormed = true; return; }
+          const Poly &L = li->second, &R = ri->second;
+          Poly out;
+          long long *lcpt, *rcpt;
+          bool Lc = (L.qa == 0 && L.a == 0) && (lcpt = constOf2(b.lhs));
+          bool Rc = (R.qa == 0 && R.a == 0) && (rcpt = constOf2(b.rhs));
+          if (b.binary == BOP::Add)        out = {L.qa + R.qa, L.a + R.a, L.c + R.c};
+          else if (b.binary == BOP::Sub)   out = {L.qa - R.qa, L.a - R.a, L.c - R.c};
+          else if (b.binary == BOP::Mul) {
+            if (Lc && Rc) { out = {0, 0, mul32A(*lcpt, *rcpt, illFormed)}; }
+            else if (Lc)  { out = mulK(R, *lcpt, illFormed); }  // R is the poly, K=*lcpt
+            else if (Rc)  { out = mulK(L, *rcpt, illFormed); }  // L is the poly, K=*rcpt
+            else { out = {qaMul(L.a*1LL, R.a, illFormed), 0, 0}; }
+          } else { illFormed = true; return; }
+          wrap32Poly(out, illFormed);
+          if (illFormed) return;
+          polyOf[b.dest] = out;
         }
-        return found;
       };
-      // Helper: resolve a term slot to affine (a, c). A term may be:
-      //  - iSlot itself → (1, 0)
-      //  - a single-def Const slot → (0, const)
-      //  - a single-use body temp Binary `t = i +/- K` or `i * K` (K const)
-      auto resolveTerm = [&](int slot, long long &a, long long &c) -> bool {
-        if (slot == iSlot) { a = 1; c = 0; return true; }
-        auto cr = constOf(slot);
-        if (cr.ok) { a = 0; c = cr.v; return true; }
-        std::size_t tIdx = findBodyDef(slot);
-        if (tIdx == std::size_t(-1)) return false;
-        const auto &t = fn.instructions[tIdx];
-        if (t.op != Op::Binary) return false;
-        bool lIsI = (t.lhs == iSlot), rIsI = (t.rhs == iSlot);
-        if (!lIsI && !rIsI) return false;
-        int otherSlot = lIsI ? t.rhs : t.lhs;
-        auto oc = constOf(otherSlot);
-        if (!oc.ok) return false;
-        long long K = oc.v;
-        if (t.binary == BOP::Add) { a = 1; c = K; }
-        else if (t.binary == BOP::Sub && lIsI) { a = 1; c = -K; }
-        else if (t.binary == BOP::Mul) { a = K; c = 0; }
-        else return false;
-        // Term temp must be single-use (only the chain reads it).
-        const auto uses = computeUseCount(fn);
-        int tUses = uses.count(slot) ? uses.at(slot) : 0;
-        if (tUses != 1) return false;
-        return true;
-      };
+      evalBody();
+      if (illFormed) return false;
 
-      // Trace the reduction chain backward from accWriteIdx. Each step is
-      // `link = prevLink +/- term`. The link operand is accSlot or a body
-      // temp defined as `prevLink +/- term`; the term operand is an affine
-      // leaf in i (i, const, or `i +/- K` temp) — i.e. resolveTerm succeeds.
-      // Stop when prevLink == accSlot (the live-in read).
-      long long aCoef = 0, cConst = 0;
-      std::size_t cur = accWriteIdx;
-      int linkSlot = -1;
-      std::unordered_set<int> visited;
-      for (int iter = 0; iter < 16; ++iter) {  // bound chain length
-        if (visited.count(static_cast<int>(cur))) return false;
-        visited.insert(static_cast<int>(cur));
-        const auto &b = fn.instructions[cur];
-        if (b.op != Op::Binary || (b.binary != BOP::Add && b.binary != BOP::Sub))
-          return false;
-        // Classify operands: a "term" resolves to affine-in-i; the other is
-        // the link (accSlot or a body-defined chain temp). accSlot is never a
-        // term (it's the accumulator).
-        long long la = 0, lc = 0, ra = 0, rc = 0;
-        bool lhsTerm = (b.lhs != accSlot) && resolveTerm(b.lhs, la, lc);
-        bool rhsTerm = (b.rhs != accSlot) && resolveTerm(b.rhs, ra, rc);
-        if (lhsTerm && rhsTerm) return false;  // both terms, no link
-        if (!lhsTerm && !rhsTerm) return false;  // no term
-        int termSlot, nextLink; long long ta, tc, sign;
-        if (lhsTerm) {
-          // form: term op link. Add → +term; Sub → term - link (negates chain) → reject
-          if (b.binary == BOP::Sub) return false;
-          termSlot = b.lhs; nextLink = b.rhs; ta = la; tc = lc; sign = 1;
-        } else {
-          // form: link op term. Add → +term; Sub → -term
-          termSlot = b.rhs; nextLink = b.lhs; ta = ra; tc = rc;
-          sign = (b.binary == BOP::Sub) ? -1 : 1;
-        }
-        (void)termSlot;
-        aCoef += sign * ta;
-        cConst += sign * tc;
-        if (nextLink == accSlot) { linkSlot = nextLink; break; }  // chain end
-        std::size_t nextDef = findBodyDef(nextLink);
-        if (nextDef == std::size_t(-1)) return false;  // link not body-defined
-        cur = nextDef;
-        linkSlot = nextLink;
-      }
-      if (linkSlot != accSlot) return false;  // chain didn't reach the live-in read
+      // The accumulator was seeded as the zero polynomial, and evalBody forwards
+//      it through the body's `s = s + ...` / `s = term` (where term reads the
+//      prior s) writes. So polyOf[accSlot] after evalBody IS the per-iteration
+//      increment, regardless of whether the final write is `s = s + term`,
+//      `Move s = term`, or an irreducible `s = X + Y` where s was consumed
+//      earlier (e.g. s = (s + i*i + 7*i) + 5).
+      auto accIt = polyOf.find(accSlot);
+      if (accIt == polyOf.end()) return false;
+      long long qaCoef = accIt->second.qa;
+      long long aCoef  = accIt->second.a;
+      long long cConst = accIt->second.c;
+      // Reject a zero increment (no reduction happening) — leave to DCE.
+      if (qaCoef == 0 && aCoef == 0 && cConst == 0) return false;
+      (void)accWriteIdx;
       (void)indIdx;
 
       // ---- Resolve i_init, N, s_init as constants; normalize cmp to "i OP bound". ----
@@ -1225,7 +1250,7 @@ bool loopSumElimPass(ir::Function &fn) {
       long long base = aI + cConst;
       if (ok && ((aI > 0 && cConst > 0 && base < aI) ||
                  (aI < 0 && cConst < 0 && base > aI))) ok = false;
-      long long term1 = safeMul(T, base, ok);
+      long long term1 = safeMul(T, base, ok);                 // a*Σi + c*T part
       long long Tm1 = T - 1;
       long long tri = safeMul(T, Tm1, ok);  // T*(T-1), always even
       bool triNeg = tri < 0;
@@ -1233,11 +1258,39 @@ bool loopSumElimPass(ir::Function &fn) {
       tri /= 2;
       if (triNeg) tri = -tri;
       long long astep = safeMul(aCoef, step, ok);
-      long long term2 = safeMul(astep, tri, ok);
+      long long term2 = safeMul(astep, tri, ok);               // a*step*tri
+      // Quadratic part: Σi² = T*iInit² + 2*iInit*step*tri + step² * T*(T-1)*(2T-1)/6.
+      // Cubic C = T*(T-1)*(2T-1)/6, term3 = qa*(T*i0² + 2*i0*step*tri + step²*C).
+      long long qaSum = 0;
+      if (qaCoef != 0) {
+        long long i0sq = safeMul(iInit, iInit, ok);
+        long long tq = safeMul(T, i0sq, ok);                  // T*iInit²
+        long long two = safeMul(2, iInit, ok);
+        long long mid = safeMul(two, step, ok);
+        mid = safeMul(mid, tri, ok);                          // 2*i0*step*tri
+        long long stepsq = safeMul(step, step, ok);
+        long long twotm1 = 2 * T - 1;                             // 2T-1
+        long long cube = safeMul(tri, twotm1, ok);                // T*(T-1)/2 * (2T-1)
+        if (ok && cube % 3 != 0) ok = false;                      // /6 = /2/3 → must be divisible
+        cube /= 3;                                                // = T*(T-1)*(2T-1)/6
+        long long last = safeMul(stepsq, cube, ok);               // step²*C
+        long long sumsq = tq + mid;
+        if (ok && ((tq > 0 && mid > 0 && sumsq < tq) ||
+                   (tq < 0 && mid < 0 && sumsq > tq))) ok = false;
+        sumsq += last;
+        if (ok && ((sumsq - last > 0 && last > 0 && sumsq < (sumsq - last)) ||
+                   (sumsq - last < 0 && last < 0 && sumsq > (sumsq - last)))) ok = false;
+        qaSum = safeMul(qaCoef, sumsq, ok);                  // qa*Σi²
+      }
       if (!ok) return false;
-      long long sum = term1 + term2;
-      if ((term1 > 0 && term2 > 0 && sum < term1) ||
-          (term1 < 0 && term2 < 0 && sum > term1)) return false;
+      long long sum = term1 + term2 + qaSum;
+      if (getenv("TOYCC_DEBUG_LOSELIM")) fprintf(stderr, "LOSELIM qa=%lld a=%lld c=%lld T=%lld i0=%lld step=%lld sum=%lld\n", qaCoef, aCoef, cConst, T, iInit, step, sum);
+      auto ovl = [](long long r, long long s, long long t) -> bool {
+        return (r > 0 && s > 0 && t < r) || (r < 0 && s < 0 && t > r);
+      };
+      if (ovl(term1, term2, term1 + term2)) return false;
+      long long s12 = term1 + term2;
+      if (ovl(s12, qaSum, sum)) return false;
       long long iFinalLL = iInit + safeMul(T, step, ok);
       if (!ok) return false;
 
