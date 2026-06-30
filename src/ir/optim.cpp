@@ -925,7 +925,10 @@ long long safeMulStat(long long x, long long y, bool &bad) {
 long long trunc32Stat(long long x, bool &bad) {
   if (!bad && (x > INT32_MAX || x < INT32_MIN)) bad = true;
   if (bad) return 0;
-  return static_cast<long long>(static_cast<std::uint32_t>(x));
+  // wrap to the signed int32 representation (negative values stay negative,
+  // not their unsigned 2^32-1 form) so downstream arithmetic sees -23, not
+  // 4294967273.
+  return static_cast<long long>(static_cast<int>(static_cast<std::uint32_t>(x)));
 }
 }  // namespace
 
