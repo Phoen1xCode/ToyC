@@ -1079,10 +1079,10 @@ bool loopSumElimPass(ir::Function &fn) {
       }
       if (iSlot == -1) return false;
 
-      // Identify the accumulator `s`: the slot written in the body (excl. i)
-      // that is read AFTER the loop (live-out). Chain temps are single-use
-      // within the body and dead after, so the live-out slot is `s`. Require
-      // exactly one.
+      // Identify accumulators: body-written slots (excl. i) that are live-out
+      // (read after the loop). Supports multiple accumulators — e.g.
+      // `while(..){ s += i; t += 3*i; i++; }` has two live-out accumulators,
+      // each closed-formable independently.
       std::unordered_set<int> bodyWritten;
       for (std::size_t bi : bodyInsts) {
         const auto &b = fn.instructions[bi];
@@ -1092,24 +1092,21 @@ bool loopSumElimPass(ir::Function &fn) {
       std::unordered_set<int> liveOut;
       for (std::size_t j = endIdx + 1; j < fn.instructions.size(); ++j)
         for (int s : readsOf(fn.instructions[j])) liveOut.insert(s);
-      int accSlot = -1;
-      for (int w : bodyWritten) {
-        if (liveOut.count(w)) {
-          if (accSlot != -1) return false;  // ambiguous accumulator
-          accSlot = w;
-        }
+      std::vector<int> accSlots;
+      for (int w : bodyWritten)
+        if (liveOut.count(w)) accSlots.push_back(w);
+      if (accSlots.empty()) return false;  // no live-out accumulator → leave to DCE
+      // Each accumulator must be written exactly once in the body (single
+      // reduction write); multiple writes mean the per-iteration increment
+      // isn't a simple polynomial.
+      for (int acc : accSlots) {
+        int writes = 0;
+        for (std::size_t bi : bodyInsts)
+          if (fn.instructions[bi].dest == acc) ++writes;
+        if (writes != 1) return false;
       }
-      if (accSlot == -1) return false;  // no live-out accumulator → leave to DCE
-
-      // The Binary that writes back to accSlot (the chain tail).
       std::size_t accWriteIdx = std::size_t(-1);
-      for (std::size_t bi : bodyInsts) {
-        if (fn.instructions[bi].dest == accSlot) {
-          if (accWriteIdx != std::size_t(-1)) return false;  // written twice
-          accWriteIdx = bi;
-        }
-      }
-      if (accWriteIdx == std::size_t(-1)) return false;
+      (void)accWriteIdx;
 
       // Helper: find the body Binary/Const index that defines `slot` (single def).
       // Polynomial in the induction i: qa*i^2 + a*i + c. We evaluate forward
@@ -1133,11 +1130,11 @@ bool loopSumElimPass(ir::Function &fn) {
       // globalConst référent used by a Mul operand resolves even if the Const
       // sits above the loop.
       for (const auto &kv : globalConst) polyOf[kv.first] = {0, 0, kv.second};
-      // Seed the accumulator as the zero polynomial. The body computes
-      // `s = s + term` (an additive reduction); for the reduction we only need
-      // the *increment* per iteration, so s's live-in value is irrelevant —
-      // treat it as 0 and emit `s = s + Σterm` separately at the end.
-      polyOf[accSlot] = {0, 0, 0};
+      // Seed every accumulator as the zero polynomial. The body computes
+      // `acc = acc + term` (an additive reduction); for the reduction we only
+      // need the *increment* per iteration, so acc's live-in value is
+      // irrelevant — treat it as 0 and emit `acc = acc + Σterm` per acc.
+      for (int acc : accSlots) polyOf[acc] = {0, 0, 0};
       bool illFormed = false;
       auto constOf2 = [&](int s) -> long long* {
         auto it = polyOf.find(s);
@@ -1187,19 +1184,20 @@ bool loopSumElimPass(ir::Function &fn) {
       evalBody();
       if (illFormed) return false;
 
-      // The accumulator was seeded as the zero polynomial, and evalBody forwards
-//      it through the body's `s = s + ...` / `s = term` (where term reads the
-//      prior s) writes. So polyOf[accSlot] after evalBody IS the per-iteration
-//      increment, regardless of whether the final write is `s = s + term`,
-//      `Move s = term`, or an irreducible `s = X + Y` where s was consumed
-//      earlier (e.g. s = (s + i*i + 7*i) + 5).
-      auto accIt = polyOf.find(accSlot);
-      if (accIt == polyOf.end()) return false;
-      long long qaCoef = accIt->second.qa;
-      long long aCoef  = accIt->second.a;
-      long long cConst = accIt->second.c;
-      // Reject a zero increment (no reduction happening) — leave to DCE.
-      if (qaCoef == 0 && aCoef == 0 && cConst == 0) return false;
+      // Each accumulator was seeded as the zero polynomial, and evalBody forwards
+      // it through its body writes. So polyOf[acc] after evalBody IS that
+      // accumulator's per-iteration increment, regardless of whether the final
+      // write is `acc = acc + term`, `Move acc = term`, or an irreducible
+      // `acc = X + Y` where acc was consumed earlier.
+      struct AccPoly { int slot; long long qa, a, c; };
+      std::vector<AccPoly> accs;
+      for (int acc : accSlots) {
+        auto it = polyOf.find(acc);
+        if (it == polyOf.end()) return false;
+        if (it->second.qa == 0 && it->second.a == 0 && it->second.c == 0)
+          return false;  // zero increment — not a reduction, leave to DCE
+        accs.push_back({acc, it->second.qa, it->second.a, it->second.c});
+      }
       (void)accWriteIdx;
       (void)indIdx;
 
@@ -1283,76 +1281,89 @@ bool loopSumElimPass(ir::Function &fn) {
         return x * y;
       };
       bool ok = true;
-      long long aI = safeMul(aCoef, iInit, ok);
-      long long base = aI + cConst;
-      if (ok && ((aI > 0 && cConst > 0 && base < aI) ||
-                 (aI < 0 && cConst < 0 && base > aI))) ok = false;
-      long long term1 = safeMul(T, base, ok);                 // a*Σi + c*T part
       long long Tm1 = T - 1;
       long long tri = safeMul(T, Tm1, ok);  // T*(T-1), always even
       bool triNeg = tri < 0;
       tri = triNeg ? -tri : tri;
       tri /= 2;
       if (triNeg) tri = -tri;
-      long long astep = safeMul(aCoef, step, ok);
-      long long term2 = safeMul(astep, tri, ok);               // a*step*tri
-      // Quadratic part: Σi² = T*iInit² + 2*iInit*step*tri + step² * T*(T-1)*(2T-1)/6.
-      // Cubic C = T*(T-1)*(2T-1)/6, term3 = qa*(T*i0² + 2*i0*step*tri + step²*C).
-      long long qaSum = 0;
-      if (qaCoef != 0) {
-        long long i0sq = safeMul(iInit, iInit, ok);
-        long long tq = safeMul(T, i0sq, ok);                  // T*iInit²
-        long long two = safeMul(2, iInit, ok);
-        long long mid = safeMul(two, step, ok);
-        mid = safeMul(mid, tri, ok);                          // 2*i0*step*tri
-        long long stepsq = safeMul(step, step, ok);
-        long long twotm1 = 2 * T - 1;                             // 2T-1
-        long long cube = safeMul(tri, twotm1, ok);                // T*(T-1)/2 * (2T-1)
-        if (ok && cube % 3 != 0) ok = false;                      // /6 = /2/3 → must be divisible
-        cube /= 3;                                                // = T*(T-1)*(2T-1)/6
-        long long last = safeMul(stepsq, cube, ok);               // step²*C
-        long long sumsq = tq + mid;
-        if (ok && ((tq > 0 && mid > 0 && sumsq < tq) ||
-                   (tq < 0 && mid < 0 && sumsq > tq))) ok = false;
-        sumsq += last;
-        if (ok && ((sumsq - last > 0 && last > 0 && sumsq < (sumsq - last)) ||
-                   (sumsq - last < 0 && last < 0 && sumsq > (sumsq - last)))) ok = false;
-        qaSum = safeMul(qaCoef, sumsq, ok);                  // qa*Σi²
-      }
-      if (!ok) return false;
-      long long sum = term1 + term2 + qaSum;
-      if (getenv("TOYCC_DEBUG_LOSELIM")) fprintf(stderr, "LOSELIM qa=%lld a=%lld c=%lld T=%lld i0=%lld step=%lld sum=%lld\n", qaCoef, aCoef, cConst, T, iInit, step, sum);
-      auto ovl = [](long long r, long long s, long long t) -> bool {
-        return (r > 0 && s > 0 && t < r) || (r < 0 && s < 0 && t > r);
-      };
-      if (ovl(term1, term2, term1 + term2)) return false;
-      long long s12 = term1 + term2;
-      if (ovl(s12, qaSum, sum)) return false;
-      long long iFinalLL = iInit + safeMul(T, step, ok);
+      // Shared quadratic-invariant pieces (independent of the accumulator's
+      // coefficients): Σi² = T*i0² + 2*i0*step*tri + step² * C, where
+      // C = T*(T-1)*(2T-1)/6.
+      long long i0sq = safeMul(iInit, iInit, ok);
+      long long tq = safeMul(T, i0sq, ok);                  // T*iInit²
+      long long two = safeMul(2, iInit, ok);
+      long long mid = safeMul(two, step, ok);
+      mid = safeMul(mid, tri, ok);                          // 2*i0*step*tri
+      long long stepsq = safeMul(step, step, ok);
+      long long twotm1 = 2 * T - 1;                         // 2T-1
+      long long cube = safeMul(tri, twotm1, ok);            // T*(T-1)/2 * (2T-1)
+      if (ok && cube % 3 != 0) ok = false;                  // /6 = /2/3 → must be divisible
+      cube /= 3;                                            // = T*(T-1)*(2T-1)/6
+      long long last = safeMul(stepsq, cube, ok);           // step²*C
+      long long sumsq = tq + mid;
+      if (ok && ((tq > 0 && mid > 0 && sumsq < tq) ||
+                 (tq < 0 && mid < 0 && sumsq > tq))) ok = false;
+      sumsq += last;
+      if (ok && ((sumsq - last > 0 && last > 0 && sumsq < (sumsq - last)) ||
+                 (sumsq - last < 0 && last < 0 && sumsq > (sumsq - last)))) ok = false;
       if (!ok) return false;
 
-      // trunc32 matches two's-complement wraparound (no-op when no overflow,
-      // which is the guaranteed case for no-UB programs; correct otherwise
-      // because 32-bit addition is associative mod 2^32).
       auto trunc32 = [](long long x) -> int {
         return static_cast<int>(static_cast<std::uint32_t>(x));
       };
-      int sum32 = trunc32(sum);
+      auto ovl = [](long long r, long long s, long long t) -> bool {
+        return (r > 0 && s > 0 && t < r) || (r < 0 && s < 0 && t > r);
+      };
+
+      // Per-accumulator closed-form sum: Σ (qa*i² + a*i + c) =
+      // qa*Σi² + a*Σi + c*T, where Σi = T*i0 + step*tri.
+      // Returns the int32 sum, or sets ok=false on overflow.
+      auto accSum = [&](const AccPoly &ap, bool &ok) -> long long {
+        long long aI = safeMul(ap.a, iInit, ok);
+        long long base = aI + ap.c;
+        if (ok && ((aI > 0 && ap.c > 0 && base < aI) ||
+                   (aI < 0 && ap.c < 0 && base > aI))) ok = false;
+        long long t1 = safeMul(T, base, ok);                // a*Σi + c*T
+        long long astep = safeMul(ap.a, step, ok);
+        long long t2 = safeMul(astep, tri, ok);             // a*step*tri
+        long long qaPart = safeMul(ap.qa, sumsq, ok);       // qa*Σi²
+        if (!ok) return 0;
+        long long s = t1 + t2;
+        if (ovl(t1, t2, s)) { ok = false; return 0; }
+        s += qaPart;
+        if (ovl(s - qaPart, qaPart, s)) { ok = false; return 0; }
+        return s;
+      };
+
+      // Compute each accumulator's int32 sum; reject on any overflow.
+      std::vector<std::pair<int, int>> emits;  // (accSlot, sum32)
+      for (const auto &ap : accs) {
+        bool ok2 = true;
+        long long s = accSum(ap, ok2);
+        if (!ok2) return false;
+        emits.push_back({ap.slot, trunc32(s)});
+      }
+      long long iFinalLL = iInit + safeMul(T, step, ok);
+      if (!ok) return false;
       int iFinal32 = trunc32(iFinalLL);
 
-      // ---- Rewrite: replace [ci, endIdx) with:
-      //   Const sum → newTmp; Binary s = s Add newTmp; Const i_final → i
-      // The additive `s = s + sum` is sound for nested/sequential loops.
-      // constFold collapses it to a single Const when s_init is known. ----
-      const int newTmp = fn.slotCount++;
+      // ---- Rewrite: replace [ci, endIdx) with, per accumulator:
+      //   Const sum_k → newTmp_k; Binary acc_k = acc_k Add newTmp_k;
+      // then `Const i_final → i`. The additive `acc = acc + sum` form is
+      // sound for nested/sequential loops; constFold collapses it to a
+      // single Const when acc_init is known. ----
       std::vector<Inst> out;
-      out.reserve(fn.instructions.size() - (endIdx - ci) + 6);
+      out.reserve(fn.instructions.size() - (endIdx - ci) + 2 * emits.size() + 2);
       for (std::size_t j = 0; j < ci; ++j) out.push_back(fn.instructions[j]);
-      Inst sc; sc.op = Op::Const; sc.dest = newTmp; sc.value = sum32;
-      out.push_back(sc);
-      Inst add; add.op = Op::Binary; add.dest = accSlot; add.lhs = accSlot;
-      add.rhs = newTmp; add.binary = ir::BinaryOp::Add;
-      out.push_back(add);
+      for (const auto &e : emits) {
+        const int newTmp = fn.slotCount++;
+        Inst sc; sc.op = Op::Const; sc.dest = newTmp; sc.value = e.second;
+        out.push_back(sc);
+        Inst add; add.op = Op::Binary; add.dest = e.first; add.lhs = e.first;
+        add.rhs = newTmp; add.binary = ir::BinaryOp::Add;
+        out.push_back(add);
+      }
       Inst ic; ic.op = Op::Const; ic.dest = iSlot; ic.value = iFinal32;
       out.push_back(ic);
       for (std::size_t j = endIdx; j < fn.instructions.size(); ++j)
