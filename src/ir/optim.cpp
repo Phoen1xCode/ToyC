@@ -1022,8 +1022,13 @@ bool loopSumElimPass(ir::Function &fn) {
       }
       if (bodyInsts.empty() || bodyInsts.size() > 48) return false;
 
-      // Identify the induction update: self-add/sub `i = i +/- step` where dest
-      // appears in the comparison. ( rhs must be a const nonzero. )
+      // Identify the induction update. Two shapes:
+      //  (1) self-add/sub `i = i +/- step` (Binary dest==lhs, rhs const),
+      //      where dest appears in the comparison;
+      //  (2) after copy-propagation the self-update is aliased to a temp:
+      //      `t = i + step` (body temp) then `Move i = t`. We detect this by
+      //      scanning for a Move whose dest is a cmp operand and whose source
+      //      temp is defined in the body as `t = i +/- K` (K const nonzero).
       int iSlot = -1;
       long long step = 0;
       std::size_t indIdx = std::size_t(-1);
@@ -1038,6 +1043,37 @@ bool loopSumElimPass(ir::Function &fn) {
           if (!r.ok || r.v == 0) return false;
           iSlot = b.dest;
           step = (b.binary == BOP::Sub) ? -r.v : r.v;
+          indIdx = bi;
+        }
+      }
+      if (iSlot == -1) {
+        // Shape (2): Move i <- t where t is a body temp `i +/- K`.
+        for (std::size_t bi : bodyInsts) {
+          const auto &b = fn.instructions[bi];
+          if (b.op != Op::Move) continue;
+          if (b.dest != cmpIns.lhs && b.dest != cmpIns.rhs) continue;
+          if (b.dest == -1) continue;
+          // find the body def of the source temp
+          std::size_t tdef = std::size_t(-1);
+          for (std::size_t bi2 : bodyInsts) {
+            if (fn.instructions[bi2].dest == b.lhs) {
+              if (tdef != std::size_t(-1)) { tdef = std::size_t(-1); break; }
+              tdef = bi2;
+            }
+          }
+          if (tdef == std::size_t(-1)) continue;
+          const auto &t = fn.instructions[tdef];
+          if (t.op != Op::Binary) continue;
+          bool lIsI = (t.lhs == b.dest), rIsI = (t.rhs == b.dest);
+          if (!lIsI && !rIsI) continue;
+          int other = lIsI ? t.rhs : t.lhs;
+          auto oc = constOf(other);
+          if (!oc.ok || oc.v == 0) continue;
+          if (t.binary == BOP::Add) step = oc.v;
+          else if (t.binary == BOP::Sub && lIsI) step = -oc.v;
+          else continue;
+          if (iSlot != -1) return false;  // two induction vars
+          iSlot = b.dest;
           indIdx = bi;
         }
       }
