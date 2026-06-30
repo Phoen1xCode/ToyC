@@ -1123,14 +1123,6 @@ bool loopSumElimPass(ir::Function &fn) {
         return {safeMulStat(p.qa, K, ok), safeMulStat(p.a, K, ok),
                 safeMulStat(p.c, K, ok)};
       };
-      // b*a style for the (L.a)*(R.a) quadratic coefficient, with signed wrap.
-      auto qaMul = [](long long x, long long y, bool &ok) -> long long {
-        return safeMulStat(x, y, ok);
-      };
-      // const × const as int32 product (wrap-safe when both already 32-bit).
-      auto mul32A = [](long long x, long long y, bool &ok) -> long long {
-        return safeMulStat(x, y, ok);
-      };
       // Wrap a Poly into int32 range (two's complement): no-op if fits.
       auto wrap32Poly = [](Poly &p, bool &ok) {
         p.qa = trunc32Stat(p.qa, ok); p.a = trunc32Stat(p.a, ok); p.c = trunc32Stat(p.c, ok);
@@ -1173,10 +1165,19 @@ bool loopSumElimPass(ir::Function &fn) {
           if (b.binary == BOP::Add)        out = {L.qa + R.qa, L.a + R.a, L.c + R.c};
           else if (b.binary == BOP::Sub)   out = {L.qa - R.qa, L.a - R.a, L.c - R.c};
           else if (b.binary == BOP::Mul) {
-            if (Lc && Rc) { out = {0, 0, mul32A(*lcpt, *rcpt, illFormed)}; }
+            if (Lc && Rc) { out = {0, 0, safeMulStat(*lcpt, *rcpt, illFormed)}; }
             else if (Lc)  { out = mulK(R, *lcpt, illFormed); }  // R is the poly, K=*lcpt
             else if (Rc)  { out = mulK(L, *rcpt, illFormed); }  // L is the poly, K=*rcpt
-            else { out = {qaMul(L.a*1LL, R.a, illFormed), 0, 0}; }
+            else {
+              // affine × affine (both qa==0): (a1*i+c1)(a2*i+c2) = a1*a2*i² +
+              // (a1*c2 + a2*c1)*i + c1*c2. If either operand has qa≠0 the
+              // product is degree ≥3 — out of scope, reject.
+              if (L.qa != 0 || R.qa != 0) { illFormed = true; return; }
+              long long qa = safeMulStat(L.a, R.a, illFormed);
+              long long a = safeMulStat(L.a, R.c, illFormed) + safeMulStat(R.a, L.c, illFormed);
+              long long c = safeMulStat(L.c, R.c, illFormed);
+              out = {qa, a, c};
+            }
           } else { illFormed = true; return; }
           wrap32Poly(out, illFormed);
           if (illFormed) return;
